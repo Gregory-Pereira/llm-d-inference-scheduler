@@ -19,11 +19,13 @@ package preciseprefixcache
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 
-	"github.com/llm-d/llm-d-kv-cache/pkg/kvcache"
-	"github.com/llm-d/llm-d-kv-cache/pkg/kvcache/kvblock"
-	"github.com/llm-d/llm-d-kv-cache/pkg/kvevents"
+	"github.com/jellydator/ttlcache/v3"
+	"github.com/llm-d/llm-d-router/pkg/kvcache"
+	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
+	"github.com/llm-d/llm-d-router/pkg/kvevents"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	k8stypes "k8s.io/apimachinery/pkg/types"
@@ -39,7 +41,8 @@ import (
 
 type fakeKVCacheIndexer struct {
 	computeFromTokens func(ctx context.Context, tokens []uint32, model string, extra []*kvblock.BlockExtraFeatures) ([]kvblock.BlockHash, error)
-	index             *fakeKVBlockIndex
+	matchBlockKeys    func(ctx context.Context, keys []kvblock.BlockHash, podFilter sets.Set[string]) (map[string]kvcache.PodMatch, error)
+	index             kvblock.Index
 }
 
 func (f *fakeKVCacheIndexer) ComputeBlockKeysFromTokens(ctx context.Context, tokens []uint32, model string, extra []*kvblock.BlockExtraFeatures) ([]kvblock.BlockHash, error) {
@@ -51,16 +54,19 @@ func (f *fakeKVCacheIndexer) ComputeBlockKeysFromTokens(ctx context.Context, tok
 
 func (f *fakeKVCacheIndexer) KVBlockIndex() kvblock.Index { return f.index }
 
+func (f *fakeKVCacheIndexer) MatchBlockKeys(ctx context.Context, keys []kvblock.BlockHash, podFilter sets.Set[string]) (map[string]kvcache.PodMatch, error) {
+	if f.matchBlockKeys != nil {
+		return f.matchBlockKeys(ctx, keys, podFilter)
+	}
+	return map[string]kvcache.PodMatch{}, nil
+}
+
 type fakeKVBlockIndex struct {
-	lookup  func(ctx context.Context, keys []kvblock.BlockHash, podSet sets.Set[string]) (map[kvblock.BlockHash][]kvblock.PodEntry, error)
 	addFn   func(ctx context.Context, prevKeys, keys []kvblock.BlockHash, entries []kvblock.PodEntry) error
 	clearFn func(ctx context.Context, podIdentifier string) error
 }
 
-func (f *fakeKVBlockIndex) Lookup(ctx context.Context, keys []kvblock.BlockHash, podSet sets.Set[string]) (map[kvblock.BlockHash][]kvblock.PodEntry, error) {
-	if f.lookup != nil {
-		return f.lookup(ctx, keys, podSet)
-	}
+func (f *fakeKVBlockIndex) Lookup(_ context.Context, _ []kvblock.BlockHash, _ sets.Set[string]) (map[kvblock.BlockHash][]kvblock.PodEntry, error) {
 	return map[kvblock.BlockHash][]kvblock.PodEntry{}, nil
 }
 
@@ -86,33 +92,18 @@ func (f *fakeKVBlockIndex) Clear(ctx context.Context, podIdentifier string) erro
 	return nil
 }
 
-type fakeKVBlockScorer struct {
-	score func(ctx context.Context, keys []kvblock.BlockHash, keyToPods map[kvblock.BlockHash][]kvblock.PodEntry) (map[string]float64, error)
-}
-
-func (f *fakeKVBlockScorer) Strategy() kvcache.KVScoringStrategy {
-	return kvcache.LongestPrefixMatch
-}
-
-func (f *fakeKVBlockScorer) Score(ctx context.Context, keys []kvblock.BlockHash, keyToPods map[kvblock.BlockHash][]kvblock.PodEntry) (map[string]float64, error) {
-	if f.score != nil {
-		return f.score(ctx, keys, keyToPods)
-	}
-	return map[string]float64{}, nil
-}
-
 var testEndpoints = []scheduling.Endpoint{
 	scheduling.NewEndpoint(
 		&fwkdl.EndpointMetadata{
-			NamespacedName: k8stypes.NamespacedName{Name: "pod-a"},
-			Address:        "10.0.0.1",
-			Port:           "8080",
+			ID:      k8stypes.NamespacedName{Name: "pod-a"},
+			Address: "10.0.0.1",
+			Port:    "8080",
 		}, nil, nil),
 	scheduling.NewEndpoint(
 		&fwkdl.EndpointMetadata{
-			NamespacedName: k8stypes.NamespacedName{Name: "pod-b"},
-			Address:        "10.0.0.2",
-			Port:           "8080",
+			ID:      k8stypes.NamespacedName{Name: "pod-b"},
+			Address: "10.0.0.2",
+			Port:    "8080",
 		}, nil, nil),
 }
 
@@ -122,24 +113,38 @@ func freshEndpoints() []scheduling.Endpoint {
 	return []scheduling.Endpoint{
 		scheduling.NewEndpoint(
 			&fwkdl.EndpointMetadata{
-				NamespacedName: k8stypes.NamespacedName{Name: "pod-a"},
-				Address:        "10.0.0.1",
-				Port:           "8080",
+				ID:      k8stypes.NamespacedName{Name: "pod-a"},
+				Address: "10.0.0.1",
+				Port:    "8080",
 			}, nil, nil),
 		scheduling.NewEndpoint(
 			&fwkdl.EndpointMetadata{
-				NamespacedName: k8stypes.NamespacedName{Name: "pod-b"},
-				Address:        "10.0.0.2",
-				Port:           "8080",
+				ID:      k8stypes.NamespacedName{Name: "pod-b"},
+				Address: "10.0.0.2",
+				Port:    "8080",
 			}, nil, nil),
 	}
 }
 
-func newProducerWithIndexer(ctx context.Context, idx kvCacheIndexer, scorer kvcache.KVBlockScorer) *Producer {
+type cancelOnMetadataEndpoint struct {
+	scheduling.Endpoint
+	cancel   context.CancelFunc
+	calls    int
+	cancelOn int
+}
+
+func (e *cancelOnMetadataEndpoint) GetMetadata() *fwkdl.EndpointMetadata {
+	e.calls++
+	if e.calls == e.cancelOn {
+		e.cancel()
+	}
+	return e.Endpoint.GetMetadata()
+}
+
+func newProducerWithIndexer(ctx context.Context, idx kvCacheIndexer) *Producer {
 	return &Producer{
 		typedName:       plugin.TypedName{Type: PluginType, Name: "test"},
 		kvCacheIndexer:  idx,
-		kvBlockScorer:   scorer,
 		kvEventsConfig:  &kvevents.Config{},
 		dk:              attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName("test"),
 		pluginState:     plugin.NewPluginState(ctx),
@@ -148,7 +153,7 @@ func newProducerWithIndexer(ctx context.Context, idx kvCacheIndexer, scorer kvca
 }
 
 // Tokens present → Produce hashes and writes per-endpoint match info.
-func TestProduce_UsesTokenizedPrompt(t *testing.T) {
+func TestProduce_UsesTokenizedRequest(t *testing.T) {
 	ctx := utils.NewTestContext(t)
 
 	tokens := []uint32{10, 20, 30, 40, 50}
@@ -161,46 +166,137 @@ func TestProduce_UsesTokenizedPrompt(t *testing.T) {
 			capturedTokens = ts
 			return []kvblock.BlockHash{wantKey}, nil
 		},
-		index: &fakeKVBlockIndex{
-			lookup: func(_ context.Context, _ []kvblock.BlockHash, _ sets.Set[string]) (map[kvblock.BlockHash][]kvblock.PodEntry, error) {
-				return map[kvblock.BlockHash][]kvblock.PodEntry{
-					wantKey: {{PodIdentifier: "10.0.0.1:8080"}},
-				}, nil
-			},
-		},
-	}
-	scorer := &fakeKVBlockScorer{
-		score: func(_ context.Context, _ []kvblock.BlockHash, _ map[kvblock.BlockHash][]kvblock.PodEntry) (map[string]float64, error) {
-			return map[string]float64{"10.0.0.1:8080": 1.0}, nil
+		matchBlockKeys: func(_ context.Context, _ []kvblock.BlockHash, _ sets.Set[string]) (map[string]kvcache.PodMatch, error) {
+			return map[string]kvcache.PodMatch{
+				"10.0.0.1:8080": {WeightedScore: 1.0, MatchedBlocks: 1, BlocksByTier: map[string]int{"gpu": 1}},
+			}, nil
 		},
 	}
 
-	p := newProducerWithIndexer(ctx, idx, scorer)
+	p := newProducerWithIndexer(ctx, idx)
 
 	req := &scheduling.InferenceRequest{
 		RequestID:   "req-1",
 		TargetModel: "test-model",
 		Body: &fwkrh.InferenceRequestBody{
-			TokenizedPrompt: &fwkrh.TokenizedPrompt{PerPromptTokens: [][]uint32{tokens}},
+			TokenizedRequest: &fwkrh.TokenizedRequest{Prompts: []fwkrh.PromptTokens{{TokenIDs: tokens}}},
 		},
 	}
 
 	require.NoError(t, p.Produce(ctx, req, testEndpoints))
 	require.Equal(t, tokens, capturedTokens)
 
-	raw, ok := testEndpoints[0].Get(attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName("test").String())
+	raw, ok := testEndpoints[0].Get(attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName("test"))
 	require.True(t, ok)
 	info, ok := raw.(*attrprefix.PrefixCacheMatchInfo)
 	require.True(t, ok)
 	assert.Equal(t, 1, info.MatchBlocks())
 	assert.Equal(t, 1, info.TotalBlocks())
 	assert.Equal(t, 16, info.BlockSizeTokens())
+	assert.Nil(t, info.MM(), "text-only request must leave MM untracked")
 
-	raw2, ok := testEndpoints[1].Get(attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName("test").String())
+	raw2, ok := testEndpoints[1].Get(attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName("test"))
 	require.True(t, ok)
 	info2 := raw2.(*attrprefix.PrefixCacheMatchInfo)
 	assert.Equal(t, 0, info2.MatchBlocks())
 	assert.Equal(t, 1, info2.TotalBlocks())
+	assert.Nil(t, info2.MM(), "text-only request must leave MM untracked")
+}
+
+func TestProduce_CancellationPublishesNoEndpointResults(t *testing.T) {
+	baseCtx := utils.NewTestContext(t)
+	ctx, cancel := context.WithCancel(baseCtx)
+	defer cancel()
+
+	const key = kvblock.BlockHash(0xCAFE)
+	idx := &fakeKVCacheIndexer{
+		computeFromTokens: func(_ context.Context, _ []uint32, _ string, _ []*kvblock.BlockExtraFeatures) ([]kvblock.BlockHash, error) {
+			return []kvblock.BlockHash{key}, nil
+		},
+		matchBlockKeys: func(_ context.Context, _ []kvblock.BlockHash, _ sets.Set[string]) (map[string]kvcache.PodMatch, error) {
+			return map[string]kvcache.PodMatch{
+				"10.0.0.1:8080": {WeightedScore: 1, MatchedBlocks: 1, BlocksByTier: map[string]int{"gpu": 1}},
+			}, nil
+		},
+	}
+	p := newProducerWithIndexer(baseCtx, idx)
+	endpoints := freshEndpoints()
+	endpoints[1] = &cancelOnMetadataEndpoint{
+		Endpoint: endpoints[1], cancel: cancel, cancelOn: 2,
+	}
+	req := &scheduling.InferenceRequest{
+		RequestID:   "req-cancel-publish",
+		TargetModel: "test-model",
+		Body: &fwkrh.InferenceRequestBody{
+			TokenizedRequest: &fwkrh.TokenizedRequest{Prompts: []fwkrh.PromptTokens{{TokenIDs: make([]uint32, testBlockSize)}}},
+		},
+	}
+
+	err := p.Produce(ctx, req, endpoints)
+	require.ErrorIs(t, err, context.Canceled)
+	for _, ep := range endpoints {
+		_, published := ep.Get(p.dk)
+		assert.False(t, published, "canceled production must not publish a partial result")
+	}
+}
+
+// The matcher is scoped to the candidate endpoints.
+func TestProduce_FiltersMatchToCandidateEndpoints(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	var gotFilter sets.Set[string]
+	idx := &fakeKVCacheIndexer{
+		computeFromTokens: func(_ context.Context, _ []uint32, _ string, _ []*kvblock.BlockExtraFeatures) ([]kvblock.BlockHash, error) {
+			return []kvblock.BlockHash{0xCAFE}, nil
+		},
+		matchBlockKeys: func(_ context.Context, _ []kvblock.BlockHash, podFilter sets.Set[string]) (map[string]kvcache.PodMatch, error) {
+			gotFilter = podFilter
+			return map[string]kvcache.PodMatch{}, nil
+		},
+	}
+	p := newProducerWithIndexer(ctx, idx)
+	req := &scheduling.InferenceRequest{
+		RequestID:   "req-filter",
+		TargetModel: "test-model",
+		Body: &fwkrh.InferenceRequestBody{
+			TokenizedRequest: &fwkrh.TokenizedRequest{Prompts: []fwkrh.PromptTokens{{TokenIDs: make([]uint32, testBlockSize)}}},
+		},
+	}
+
+	require.NoError(t, p.Produce(ctx, req, freshEndpoints()))
+	assert.Equal(t, sets.New("10.0.0.1:8080", "10.0.0.2:8080"), gotFilter)
+}
+
+// A matcher error aborts production before anything is published.
+func TestProduce_MatchErrorPublishesNothing(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	idx := &fakeKVCacheIndexer{
+		computeFromTokens: func(_ context.Context, _ []uint32, _ string, _ []*kvblock.BlockExtraFeatures) ([]kvblock.BlockHash, error) {
+			return []kvblock.BlockHash{0xCAFE}, nil
+		},
+		matchBlockKeys: func(_ context.Context, _ []kvblock.BlockHash, _ sets.Set[string]) (map[string]kvcache.PodMatch, error) {
+			return nil, assert.AnError
+		},
+	}
+	p := newProducerWithIndexer(ctx, idx)
+	endpoints := freshEndpoints()
+	req := &scheduling.InferenceRequest{
+		RequestID:   "req-match-error",
+		TargetModel: "test-model",
+		Body: &fwkrh.InferenceRequestBody{
+			TokenizedRequest: &fwkrh.TokenizedRequest{Prompts: []fwkrh.PromptTokens{{TokenIDs: make([]uint32, testBlockSize)}}},
+		},
+	}
+
+	require.ErrorIs(t, p.Produce(ctx, req, endpoints), assert.AnError)
+	for _, ep := range endpoints {
+		_, published := ep.Get(p.dk)
+		assert.False(t, published)
+	}
+}
+
+// The matcher's speculative tier name is the attribute key consumers read.
+func TestSpeculativeTierKeyMatchesMatcher(t *testing.T) {
+	assert.Equal(t, attrprefix.SpeculativeTierKey, kvcache.SpeculativeTier)
 }
 
 // No tokens → no-op (no prompt-string fallback).
@@ -213,7 +309,7 @@ func TestProduce_NoTokens_NoOp(t *testing.T) {
 		},
 		index: &fakeKVBlockIndex{},
 	}
-	p := newProducerWithIndexer(ctx, idx, &fakeKVBlockScorer{})
+	p := newProducerWithIndexer(ctx, idx)
 
 	req := &scheduling.InferenceRequest{
 		RequestID:   "req-2",
@@ -226,7 +322,7 @@ func TestProduce_NoTokens_NoOp(t *testing.T) {
 }
 
 // Empty TokenIDs → no-op.
-func TestProduce_EmptyTokenizedPrompt_NoOp(t *testing.T) {
+func TestProduce_EmptyTokenizedRequest_NoOp(t *testing.T) {
 	ctx := utils.NewTestContext(t)
 	idx := &fakeKVCacheIndexer{
 		computeFromTokens: func(_ context.Context, _ []uint32, _ string, _ []*kvblock.BlockExtraFeatures) ([]kvblock.BlockHash, error) {
@@ -235,14 +331,14 @@ func TestProduce_EmptyTokenizedPrompt_NoOp(t *testing.T) {
 		},
 		index: &fakeKVBlockIndex{},
 	}
-	p := newProducerWithIndexer(ctx, idx, &fakeKVBlockScorer{})
+	p := newProducerWithIndexer(ctx, idx)
 
 	req := &scheduling.InferenceRequest{
 		RequestID:   "req-3",
 		TargetModel: "test-model",
 		Body: &fwkrh.InferenceRequestBody{
-			Completions:     &fwkrh.CompletionsRequest{Prompt: fwkrh.Prompt{Raw: "p"}},
-			TokenizedPrompt: &fwkrh.TokenizedPrompt{PerPromptTokens: [][]uint32{{}}},
+			Completions:      &fwkrh.CompletionsRequest{Prompt: fwkrh.Prompt{Raw: "p"}},
+			TokenizedRequest: &fwkrh.TokenizedRequest{Prompts: []fwkrh.PromptTokens{{TokenIDs: []uint32{}}}},
 		},
 	}
 	require.NoError(t, p.Produce(ctx, req, testEndpoints))
@@ -264,27 +360,19 @@ func TestProduce_MultiPromptEmptyBlockKeys_NoOp(t *testing.T) {
 			}
 			return nil, nil
 		},
-		index: &fakeKVBlockIndex{
-			lookup: func(_ context.Context, _ []kvblock.BlockHash, _ sets.Set[string]) (map[kvblock.BlockHash][]kvblock.PodEntry, error) {
-				t.Fatalf("Lookup must not be called when no prompt produces block keys")
-				return nil, assert.AnError
-			},
-		},
-	}
-	scorer := &fakeKVBlockScorer{
-		score: func(_ context.Context, _ []kvblock.BlockHash, _ map[kvblock.BlockHash][]kvblock.PodEntry) (map[string]float64, error) {
-			t.Fatalf("Score must not be called when no prompt produces block keys")
+		matchBlockKeys: func(_ context.Context, _ []kvblock.BlockHash, _ sets.Set[string]) (map[string]kvcache.PodMatch, error) {
+			t.Fatalf("MatchBlockKeys must not be called when no prompt produces block keys")
 			return nil, assert.AnError
 		},
 	}
 
-	p := newProducerWithIndexer(ctx, idx, scorer)
+	p := newProducerWithIndexer(ctx, idx)
 	req := &scheduling.InferenceRequest{
 		RequestID:   "req-multi-empty",
 		TargetModel: "test-model",
 		Body: &fwkrh.InferenceRequestBody{
-			TokenizedPrompt: &fwkrh.TokenizedPrompt{
-				PerPromptTokens: [][]uint32{promptA, promptB},
+			TokenizedRequest: &fwkrh.TokenizedRequest{
+				Prompts: []fwkrh.PromptTokens{{TokenIDs: promptA}, {TokenIDs: promptB}},
 			},
 		},
 	}
@@ -292,7 +380,7 @@ func TestProduce_MultiPromptEmptyBlockKeys_NoOp(t *testing.T) {
 	require.NoError(t, p.Produce(ctx, req, endpoints))
 	require.Equal(t, [][]uint32{promptA, promptB}, computeCalls)
 
-	_, ok := endpoints[0].Get(attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName("test").String())
+	_, ok := endpoints[0].Get(attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName("test"))
 	assert.False(t, ok)
 }
 
@@ -305,7 +393,7 @@ func TestProduce_MultiPromptSkipsEmptyPromptKeys(t *testing.T) {
 	wantKey := kvblock.BlockHash(0xCAFE)
 
 	var computeCalls [][]uint32
-	var lookupCalls [][]kvblock.BlockHash
+	var matchCalls [][]kvblock.BlockHash
 	idx := &fakeKVCacheIndexer{
 		computeFromTokens: func(_ context.Context, ts []uint32, _ string, _ []*kvblock.BlockExtraFeatures) ([]kvblock.BlockHash, error) {
 			computeCalls = append(computeCalls, append([]uint32{}, ts...))
@@ -319,51 +407,166 @@ func TestProduce_MultiPromptSkipsEmptyPromptKeys(t *testing.T) {
 				return nil, nil
 			}
 		},
-		index: &fakeKVBlockIndex{
-			lookup: func(_ context.Context, keys []kvblock.BlockHash, _ sets.Set[string]) (map[kvblock.BlockHash][]kvblock.PodEntry, error) {
-				require.NotEmpty(t, keys)
-				lookupCalls = append(lookupCalls, append([]kvblock.BlockHash{}, keys...))
-				return map[kvblock.BlockHash][]kvblock.PodEntry{
-					wantKey: {{PodIdentifier: "10.0.0.1:8080"}},
-				}, nil
-			},
-		},
-	}
-	scorer := &fakeKVBlockScorer{
-		score: func(_ context.Context, keys []kvblock.BlockHash, _ map[kvblock.BlockHash][]kvblock.PodEntry) (map[string]float64, error) {
-			require.Equal(t, []kvblock.BlockHash{wantKey}, keys)
-			return map[string]float64{"10.0.0.1:8080": 1.0}, nil
+		matchBlockKeys: func(_ context.Context, keys []kvblock.BlockHash, _ sets.Set[string]) (map[string]kvcache.PodMatch, error) {
+			require.NotEmpty(t, keys)
+			matchCalls = append(matchCalls, append([]kvblock.BlockHash{}, keys...))
+			return map[string]kvcache.PodMatch{
+				"10.0.0.1:8080": {WeightedScore: 1.0, MatchedBlocks: 1, BlocksByTier: map[string]int{"gpu": 1}},
+			}, nil
 		},
 	}
 
-	p := newProducerWithIndexer(ctx, idx, scorer)
+	p := newProducerWithIndexer(ctx, idx)
 	req := &scheduling.InferenceRequest{
 		RequestID:   "req-multi-mixed",
 		TargetModel: "test-model",
 		Body: &fwkrh.InferenceRequestBody{
-			TokenizedPrompt: &fwkrh.TokenizedPrompt{
-				PerPromptTokens: [][]uint32{shortPrompt, fullPrompt},
+			TokenizedRequest: &fwkrh.TokenizedRequest{
+				Prompts: []fwkrh.PromptTokens{{TokenIDs: shortPrompt}, {TokenIDs: fullPrompt}},
 			},
 		},
 	}
 
 	require.NoError(t, p.Produce(ctx, req, endpoints))
 	require.Equal(t, [][]uint32{shortPrompt, fullPrompt}, computeCalls)
-	require.Equal(t, [][]kvblock.BlockHash{{wantKey}}, lookupCalls)
+	require.Equal(t, [][]kvblock.BlockHash{{wantKey}}, matchCalls)
 
-	raw, ok := endpoints[0].Get(attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName("test").String())
+	raw, ok := endpoints[0].Get(attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName("test"))
 	require.True(t, ok)
 	info, ok := raw.(*attrprefix.PrefixCacheMatchInfo)
 	require.True(t, ok)
 	assert.Equal(t, 1, info.MatchBlocks())
 	assert.Equal(t, 1, info.TotalBlocks())
 
-	raw, ok = endpoints[1].Get(attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName("test").String())
+	raw, ok = endpoints[1].Get(attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName("test"))
 	require.True(t, ok)
 	info, ok = raw.(*attrprefix.PrefixCacheMatchInfo)
 	require.True(t, ok)
 	assert.Equal(t, 0, info.MatchBlocks())
 	assert.Equal(t, 1, info.TotalBlocks())
+}
+
+// Per-tier contiguous counts are attached per endpoint and summed across
+// prompts; endpoints without tier data get a non-nil empty map.
+func TestProduce_WritesCachedBlocksByTier(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	endpoints := freshEndpoints()
+
+	promptA := []uint32{1, 2, 3, 4, 5, 6, 7, 8}
+	promptB := []uint32{20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35}
+	keysA := []kvblock.BlockHash{0xA1, 0xA2}
+	keysB := []kvblock.BlockHash{0xB1}
+
+	const addr = "10.0.0.1:8080"
+
+	idx := &fakeKVCacheIndexer{
+		computeFromTokens: func(_ context.Context, ts []uint32, _ string, _ []*kvblock.BlockExtraFeatures) ([]kvblock.BlockHash, error) {
+			if len(ts) == len(promptA) {
+				return keysA, nil
+			}
+			return keysB, nil
+		},
+		matchBlockKeys: func(_ context.Context, keys []kvblock.BlockHash, _ sets.Set[string]) (map[string]kvcache.PodMatch, error) {
+			if keys[0] == keysA[0] {
+				// Prompt A: block 0 on gpu+cpu, block 1 on gpu only.
+				return map[string]kvcache.PodMatch{
+					addr: {WeightedScore: 2, MatchedBlocks: 2, BlocksByTier: map[string]int{"gpu": 2, "cpu": 1}},
+				}, nil
+			}
+			// Prompt B: single block on gpu+cpu.
+			return map[string]kvcache.PodMatch{
+				addr: {WeightedScore: 1, MatchedBlocks: 1, BlocksByTier: map[string]int{"gpu": 1, "cpu": 1}},
+			}, nil
+		},
+	}
+
+	p := newProducerWithIndexer(ctx, idx)
+	req := &scheduling.InferenceRequest{
+		RequestID:   "req-by-tier",
+		TargetModel: "test-model",
+		Body: &fwkrh.InferenceRequestBody{
+			TokenizedRequest: &fwkrh.TokenizedRequest{
+				Prompts: []fwkrh.PromptTokens{
+					{TokenIDs: promptA},
+					{TokenIDs: promptB},
+				},
+			},
+		},
+	}
+
+	require.NoError(t, p.Produce(ctx, req, endpoints))
+
+	raw, ok := endpoints[0].Get(attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName("test"))
+	require.True(t, ok)
+	info, ok := raw.(*attrprefix.PrefixCacheMatchInfo)
+	require.True(t, ok)
+	assert.Equal(t, 3, info.MatchBlocks())
+	assert.Equal(t, 3, info.CachedBlockCount())
+	// gpu: 2 (prompt A) + 1 (prompt B); cpu: 1 (prompt A) + 1 (prompt B).
+	assert.Equal(t, map[string]int{"gpu": 3, "cpu": 2}, info.CachedBlocksByTier())
+
+	raw, ok = endpoints[1].Get(attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName("test"))
+	require.True(t, ok)
+	info, ok = raw.(*attrprefix.PrefixCacheMatchInfo)
+	require.True(t, ok)
+	assert.Equal(t, 0, info.CachedBlockCount())
+	assert.NotNil(t, info.CachedBlocksByTier())
+	assert.Empty(t, info.CachedBlocksByTier())
+}
+
+// MM match uses cachedBlocks (literal), not matchLen (tier-weighted score).
+func TestProduce_MMMatchUsesCachedBlocksNotWeightedScore(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+
+	tokens := make([]uint32, 4*testBlockSize)
+	for i := range tokens {
+		tokens[i] = uint32(i)
+	}
+	keys := []kvblock.BlockHash{0xAA, 0xBB, 0xCC, 0xDD}
+	const addr = "10.0.0.1:8080"
+
+	idx := &fakeKVCacheIndexer{
+		computeFromTokens: func(_ context.Context, _ []uint32, _ string, _ []*kvblock.BlockExtraFeatures) ([]kvblock.BlockHash, error) {
+			return keys, nil
+		},
+		// Weighted score 3.2 gives matchLen=3, while all 4 blocks are cached.
+		matchBlockKeys: func(_ context.Context, _ []kvblock.BlockHash, _ sets.Set[string]) (map[string]kvcache.PodMatch, error) {
+			return map[string]kvcache.PodMatch{
+				addr: {WeightedScore: 3.2, MatchedBlocks: 4, BlocksByTier: map[string]int{"cpu": 4}},
+			}, nil
+		},
+	}
+
+	p := newProducerWithIndexer(ctx, idx)
+	endpoints := freshEndpoints()
+
+	// MM at block index 3: caught by cachedBlocks=4, missed by matchLen=3.
+	req := &scheduling.InferenceRequest{
+		RequestID:   "req-mm-weighted",
+		TargetModel: "test-model",
+		Body: &fwkrh.InferenceRequestBody{
+			TokenizedRequest: &fwkrh.TokenizedRequest{
+				Prompts: []fwkrh.PromptTokens{{
+					TokenIDs: tokens,
+					MultiModalFeatures: []fwkrh.MultiModalFeature{
+						{Modality: fwkrh.ModalityImage, Hash: "img", Offset: 48, Length: 16},
+					},
+				}},
+			},
+		},
+	}
+
+	require.NoError(t, p.Produce(ctx, req, endpoints))
+
+	raw, ok := endpoints[0].Get(attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName("test"))
+	require.True(t, ok)
+	info, ok := raw.(*attrprefix.PrefixCacheMatchInfo)
+	require.True(t, ok)
+
+	assert.Equal(t, 3, info.MatchBlocks())
+	assert.Equal(t, 4, info.CachedBlockCount())
+	require.NotNil(t, info.MM())
+	assert.Equal(t, 1, info.MM().MatchBlocks, "must use cachedBlocks, not matchLen")
 }
 
 // Multimodal features flow through to ComputeBlockKeysFromTokens.
@@ -381,25 +584,19 @@ func TestProduce_PassesMMExtraFeatures(t *testing.T) {
 			captured = extra
 			return []kvblock.BlockHash{0xAA}, nil
 		},
-		index: &fakeKVBlockIndex{
-			lookup: func(_ context.Context, _ []kvblock.BlockHash, _ sets.Set[string]) (map[kvblock.BlockHash][]kvblock.PodEntry, error) {
-				return map[kvblock.BlockHash][]kvblock.PodEntry{}, nil
-			},
-		},
 	}
-	scorer := &fakeKVBlockScorer{}
 
-	p := newProducerWithIndexer(ctx, idx, scorer)
+	p := newProducerWithIndexer(ctx, idx)
 
 	req := &scheduling.InferenceRequest{
 		RequestID:   "req-mm",
 		TargetModel: "test-model",
 		Body: &fwkrh.InferenceRequestBody{
-			TokenizedPrompt: &fwkrh.TokenizedPrompt{
-				PerPromptTokens: [][]uint32{tokens},
-				MultiModalFeatures: []fwkrh.MultiModalFeature{
-					{Modality: fwkrh.ModalityImage, Hash: "abc", Offset: 2, Length: 4},
-				},
+			TokenizedRequest: &fwkrh.TokenizedRequest{
+				Prompts: []fwkrh.PromptTokens{{
+					TokenIDs:           tokens,
+					MultiModalFeatures: []fwkrh.MultiModalFeature{{Modality: fwkrh.ModalityImage, Hash: "abc", Offset: 2, Length: 4}},
+				}},
 			},
 		},
 	}
@@ -445,16 +642,15 @@ func TestProduce_FoldsCacheSalt(t *testing.T) {
 				},
 				index: &fakeKVBlockIndex{},
 			}
-			p := newProducerWithIndexer(ctx, idx, &fakeKVBlockScorer{})
+			p := newProducerWithIndexer(ctx, idx)
 
 			req := &scheduling.InferenceRequest{
 				RequestID:   "req-salt",
 				TargetModel: "test-model",
 				Body: &fwkrh.InferenceRequestBody{
-					TokenizedPrompt: &fwkrh.TokenizedPrompt{
-						PerPromptTokens:    [][]uint32{tokens},
-						MultiModalFeatures: tc.mm,
-						CacheSalt:          "s3cr3t",
+					TokenizedRequest: &fwkrh.TokenizedRequest{
+						Prompts:   []fwkrh.PromptTokens{{TokenIDs: tokens, MultiModalFeatures: tc.mm}},
+						CacheSalt: "s3cr3t",
 					},
 				},
 			}
@@ -483,13 +679,13 @@ func TestProduce_NoCacheSalt_NoExtraFeatures(t *testing.T) {
 		},
 		index: &fakeKVBlockIndex{},
 	}
-	p := newProducerWithIndexer(ctx, idx, &fakeKVBlockScorer{})
+	p := newProducerWithIndexer(ctx, idx)
 
 	req := &scheduling.InferenceRequest{
 		RequestID:   "req-nosalt",
 		TargetModel: "test-model",
 		Body: &fwkrh.InferenceRequestBody{
-			TokenizedPrompt: &fwkrh.TokenizedPrompt{PerPromptTokens: [][]uint32{tokens}},
+			TokenizedRequest: &fwkrh.TokenizedRequest{Prompts: []fwkrh.PromptTokens{{TokenIDs: tokens}}},
 		},
 	}
 
@@ -507,20 +703,21 @@ func TestProduce_NoOpPaths(t *testing.T) {
 		},
 		index: &fakeKVBlockIndex{},
 	}
-	p := newProducerWithIndexer(ctx, idx, &fakeKVBlockScorer{})
+	p := newProducerWithIndexer(ctx, idx)
 
 	require.NoError(t, p.Produce(ctx, &scheduling.InferenceRequest{RequestID: "x"}, testEndpoints))
 	require.NoError(t, p.Produce(ctx, &scheduling.InferenceRequest{RequestID: "x", Body: &fwkrh.InferenceRequestBody{}}, testEndpoints))
 }
 
-// Tokens-only: reject legacy tokenizersPoolConfig at factory time.
+// The indexer has no tokenization pool, so a config still carrying one is
+// rejected by strict decoding rather than silently ignored.
 func TestPluginFactory_RejectsTokenizersPoolConfig(t *testing.T) {
 	handle := plugin.NewEppHandle(utils.NewTestContext(t), nil)
 	raw := json.RawMessage(`{"indexerConfig":{"tokenizersPoolConfig":{"modelName":"x"}}}`)
 
 	_, err := PluginFactory("test", plugin.StrictDecoder(raw), handle)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "tokenizersPoolConfig is not supported")
+	require.Contains(t, err.Error(), `unknown field "tokenizersPoolConfig"`)
 }
 
 // Key built from string literals so an upstream rename trips the test.
@@ -535,7 +732,7 @@ func TestProduces_DeclaresPrefixCacheMatchInfo(t *testing.T) {
 	require.True(t, ok)
 }
 
-func TestConsumes_DeclaresTokenizedPrompt(t *testing.T) {
+func TestConsumes_DeclaresTokenizedRequest(t *testing.T) {
 	p := &Producer{typedName: plugin.TypedName{Type: PluginType, Name: "x"}}
 	expected := plugin.NewDataKey("TokenizedPrompt", "token-producer")
 	_, ok := p.Consumes().Required[expected]
@@ -578,20 +775,20 @@ func TestNew_BlockSizeFlowsViaTokenProcessor(t *testing.T) {
 				tokens[i] = uint32(i + 1)
 			}
 			endpoint := scheduling.NewEndpoint(&fwkdl.EndpointMetadata{
-				NamespacedName: k8stypes.NamespacedName{Name: "pod-x"},
-				Address:        "10.0.0.9",
-				Port:           "8080",
+				ID:      k8stypes.NamespacedName{Name: "pod-x"},
+				Address: "10.0.0.9",
+				Port:    "8080",
 			}, nil, nil)
 			req := &scheduling.InferenceRequest{
 				RequestID:   "r",
 				TargetModel: "m",
 				Body: &fwkrh.InferenceRequestBody{
-					TokenizedPrompt: &fwkrh.TokenizedPrompt{PerPromptTokens: [][]uint32{tokens}},
+					TokenizedRequest: &fwkrh.TokenizedRequest{Prompts: []fwkrh.PromptTokens{{TokenIDs: tokens}}},
 				},
 			}
 			require.NoError(t, p.Produce(ctx, req, []scheduling.Endpoint{endpoint}))
 
-			raw, ok := endpoint.Get(attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(name).String())
+			raw, ok := endpoint.Get(attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(name))
 			require.True(t, ok)
 			info, ok := raw.(*attrprefix.PrefixCacheMatchInfo)
 			require.True(t, ok, "expected *PrefixCacheMatchInfo, got %T", raw)
@@ -599,4 +796,124 @@ func TestNew_BlockSizeFlowsViaTokenProcessor(t *testing.T) {
 			assert.Equal(t, 1, info.TotalBlocks())
 		})
 	}
+}
+
+func TestNewRejectsUnsupportedKVEventEngineType(t *testing.T) {
+	ctx, cancel := context.WithCancel(utils.NewTestContext(t))
+	t.Cleanup(cancel)
+
+	idxCfg, err := kvcache.NewDefaultConfig()
+	require.NoError(t, err)
+	kvEventsCfg := kvevents.DefaultConfig()
+	kvEventsCfg.EngineType = "unsupported"
+
+	_, err = New(ctx, "unsupported-engine", PluginConfig{
+		IndexerConfig:  idxCfg,
+		KVEventsConfig: kvEventsCfg,
+	})
+	require.ErrorContains(t, err, `unsupported engine type: "unsupported"`)
+}
+
+type fakeSubscriberManager struct {
+	ids             []string
+	sourceEndpoints []string
+	endpoints       []string
+}
+
+func (f *fakeSubscriberManager) EnsureSubscriber(
+	_ context.Context,
+	id, sourceEndpoint, endpoint, _, _ string,
+	_ bool,
+) error {
+	f.ids = append(f.ids, id)
+	f.sourceEndpoints = append(f.sourceEndpoints, sourceEndpoint)
+	f.endpoints = append(f.endpoints, endpoint)
+	return nil
+}
+func (f *fakeSubscriberManager) RemoveSubscriber(_ context.Context, _ string) {}
+func (f *fakeSubscriberManager) GetActiveSubscribers() ([]string, []string) {
+	return f.ids, f.endpoints
+}
+func (f *fakeSubscriberManager) Shutdown(_ context.Context) {}
+
+func TestDumpState(t *testing.T) {
+	// Start() is intentionally not called: NoTTL entries never expire, and the
+	// enumeration helpers work on an unstarted cache.
+	specCache := ttlcache.New[string, *speculativeEntries]()
+	specCache.Set("req-2", &speculativeEntries{}, ttlcache.NoTTL)
+	specCache.Set("req-1", &speculativeEntries{}, ttlcache.NoTTL)
+
+	p := &Producer{
+		typedName:          plugin.TypedName{Type: PluginType, Name: "x"},
+		subscribersManager: &fakeSubscriberManager{ids: []string{"ns/pod-b", "ns/pod-a"}},
+		speculativeCache:   specCache,
+		speculativeEnabled: true,
+		blockSizeTokens:    64,
+	}
+
+	payload, err := p.DumpState()
+	require.NoError(t, err)
+	// Subscriber pod identities and live request ids are enumerated for debugging.
+	assert.Contains(t, string(payload), "ns/pod-a")
+
+	var state precisePrefixState
+	require.NoError(t, json.Unmarshal(payload, &state))
+	assert.Equal(t, precisePrefixState{
+		Subscribers:             []string{"ns/pod-a", "ns/pod-b"},
+		TotalSubscribers:        2,
+		MaxSubscribers:          maxDumpSubscribers,
+		SpeculativeIndexing:     true,
+		SpeculativeEntries:      []string{"req-1", "req-2"},
+		TotalSpeculativeEntries: 2,
+		MaxSpeculativeEntries:   maxDumpSpeculativeEntries,
+		BlockSizeTokens:         64,
+	}, state)
+}
+
+func TestDumpStateEmpty(t *testing.T) {
+	p := &Producer{}
+
+	payload, err := p.DumpState()
+	require.NoError(t, err)
+	assert.True(t, json.Valid(payload))
+	// Empty lists serialize as [] not null, matching the documented response shape.
+	assert.Contains(t, string(payload), `"subscribers":[]`)
+	assert.Contains(t, string(payload), `"speculativeEntries":[]`)
+
+	var state precisePrefixState
+	require.NoError(t, json.Unmarshal(payload, &state))
+	assert.Equal(t, precisePrefixState{
+		Subscribers:           []string{},
+		SpeculativeEntries:    []string{},
+		MaxSubscribers:        maxDumpSubscribers,
+		MaxSpeculativeEntries: maxDumpSpeculativeEntries,
+	}, state)
+}
+
+func TestDumpStateCaps(t *testing.T) {
+	specCache := ttlcache.New[string, *speculativeEntries]()
+	ids := make([]string, 0, maxDumpSubscribers+5)
+	for i := 0; i < maxDumpSubscribers+5; i++ {
+		ids = append(ids, fmt.Sprintf("ns/pod-%03d", i))
+	}
+	for i := 0; i < maxDumpSpeculativeEntries+7; i++ {
+		specCache.Set(fmt.Sprintf("req-%04d", i), &speculativeEntries{}, ttlcache.NoTTL)
+	}
+
+	p := &Producer{
+		subscribersManager: &fakeSubscriberManager{ids: ids},
+		speculativeCache:   specCache,
+	}
+
+	payload, err := p.DumpState()
+	require.NoError(t, err)
+
+	var state precisePrefixState
+	require.NoError(t, json.Unmarshal(payload, &state))
+	// Lists are capped, but the totals report the full counts so a consumer can
+	// tell the dump is partial from totalX > maxX.
+	assert.Len(t, state.Subscribers, maxDumpSubscribers)
+	assert.Equal(t, maxDumpSubscribers+5, state.TotalSubscribers)
+	assert.Len(t, state.SpeculativeEntries, maxDumpSpeculativeEntries)
+	assert.Equal(t, maxDumpSpeculativeEntries+7, state.TotalSpeculativeEntries)
 }

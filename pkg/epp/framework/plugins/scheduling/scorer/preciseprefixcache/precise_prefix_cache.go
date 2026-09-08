@@ -24,18 +24,21 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/llm-d/llm-d-kv-cache/pkg/kvcache"
-	"github.com/llm-d/llm-d-kv-cache/pkg/kvcache/kvblock"
-	"github.com/llm-d/llm-d-kv-cache/pkg/kvevents"
+	"github.com/llm-d/llm-d-router/pkg/kvcache"
+	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
+	"github.com/llm-d/llm-d-router/pkg/kvevents"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/llm-d/llm-d-router/pkg/common/observability/semconv"
 	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	mmobs "github.com/llm-d/llm-d-router/pkg/epp/framework/observability/multimodal"
+	attrprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/prefix"
 	preciseproducer "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/preciseprefixcache"
 	schedplugins "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling"
 	prefixscorer "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/scorer/prefix"
@@ -61,9 +64,10 @@ type PluginConfig struct {
 // Deprecated: configure precise-prefix-cache-producer and prefix-cache-scorer
 // directly.
 type Plugin struct {
-	typedName plugin.TypedName
-	producer  *legacyProducer
-	scorer    *prefixscorer.Plugin
+	typedName    plugin.TypedName
+	producer     *preciseproducer.Producer
+	scorer       *prefixscorer.Plugin
+	matchInfoKey plugin.DataKey
 }
 
 var (
@@ -94,9 +98,8 @@ func PluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handl
 		return prefixscorer.New(ctx, name, existing.TypedName().Name)
 	}
 
-	// Self-host: defaults first, then overlay the operator's YAML — matches
-	// the historical factory so partial IndexerConfig (e.g. only
-	// tokenizersPoolConfig set) doesn't leave the indexer half-built.
+	// Self-host: defaults first, then overlay the operator's YAML, so a
+	// partial IndexerConfig doesn't leave the indexer half-built.
 	defaultIndexerCfg, err := kvcache.NewDefaultConfig()
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize indexer config: %w", err)
@@ -119,7 +122,7 @@ func PluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handl
 		SpeculativeTTL:       legacy.SpeculativeTTL,
 	}
 
-	producer, err := newLegacyProducer(ctx, name, producerCfg)
+	producer, err := preciseproducer.New(ctx, name, producerCfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create internal producer for %s: %w", PrecisePrefixCachePluginType, err)
 	}
@@ -130,9 +133,10 @@ func PluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handl
 	}
 
 	return &Plugin{
-		typedName: plugin.TypedName{Type: PrecisePrefixCachePluginType, Name: name},
-		producer:  producer,
-		scorer:    scorer,
+		typedName:    plugin.TypedName{Type: PrecisePrefixCachePluginType, Name: name},
+		producer:     producer,
+		scorer:       scorer,
+		matchInfoKey: attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(name),
 	}, nil
 }
 
@@ -171,15 +175,16 @@ func (p *Plugin) Score(ctx context.Context,
 	)
 	defer span.End()
 
-	span.SetAttributes(attribute.Int("llm_d.epp.scorer.candidate_endpoints", len(endpoints)))
+	span.SetAttributes(semconv.LLMDEPPScorerCandidateEndpoints(len(endpoints)))
 	if req != nil {
 		if req.TargetModel != "" {
-			span.SetAttributes(attribute.String("gen_ai.request.model", req.TargetModel))
+			span.SetAttributes(semconv.GenAIRequestModel(req.TargetModel))
 		}
 		if req.RequestID != "" {
-			span.SetAttributes(attribute.String("gen_ai.request.id", req.RequestID))
+			span.SetAttributes(semconv.GenAIRequestID(req.RequestID))
 		}
 	}
+	span.SetAttributes(mmobs.SpanAttributes(req)...)
 
 	scores := p.scorer.Score(ctx, req, endpoints)
 
@@ -192,13 +197,41 @@ func (p *Plugin) Score(ctx context.Context,
 			totalScore += s
 		}
 		span.SetAttributes(
-			attribute.Float64("llm_d.epp.scorer.score.max", maxScore),
-			attribute.Float64("llm_d.epp.scorer.score.avg", totalScore/float64(len(scores))),
-			attribute.Int("llm_d.epp.scorer.endpoints_scored", len(scores)),
+			semconv.LLMDEPPScorerScoreMax(maxScore),
+			semconv.LLMDEPPScorerScoreAvg(totalScore/float64(len(scores))),
+			semconv.LLMDEPPScorerEndpointsScored(len(scores)),
 		)
 	}
 
+	if hit, tracked := anyMMHit(endpoints, p.matchInfoKey); tracked {
+		span.SetAttributes(attribute.Bool("mm.hit", hit))
+	}
 	return scores
+}
+
+// anyMMHit returns (hit, tracked). When no endpoint had MM tracked, the
+// caller should omit mm.hit (OTel: don't emit attributes whose value is unknown).
+func anyMMHit(endpoints []scheduling.Endpoint, key plugin.DataKey) (hit, tracked bool) {
+	for _, ep := range endpoints {
+		v, ok := ep.Get(key)
+		if !ok {
+			continue
+		}
+		info, ok := v.(*attrprefix.PrefixCacheMatchInfo)
+		if !ok {
+			continue
+		}
+		mm := info.MM()
+		if mm == nil {
+			continue
+		}
+		tracked = true
+		if mm.MatchBlocks > 0 {
+			hit = true
+			return
+		}
+	}
+	return
 }
 
 func (p *Plugin) Produces() map[plugin.DataKey]any { return p.producer.Produces() }
@@ -229,8 +262,8 @@ func (p *Plugin) Produce(ctx context.Context,
 
 func (p *Plugin) PreRequest(ctx context.Context,
 	req *scheduling.InferenceRequest, result *scheduling.SchedulingResult,
-) {
-	p.producer.PreRequest(ctx, req, result)
+) error {
+	return p.producer.PreRequest(ctx, req, result)
 }
 
 func (p *Plugin) Extract(ctx context.Context, event fwkdl.EndpointEvent) error {

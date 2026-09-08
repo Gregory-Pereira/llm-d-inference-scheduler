@@ -40,8 +40,12 @@ func TestIsSystemOwnedHeaderIncludesAliases(t *testing.T) {
 		metadata.OldTTFTSLOHeaderKey,
 		metadata.TPOTSLOHeaderKey,
 		metadata.OldTPOTSLOHeaderKey,
+		metadata.VideoFPSHeaderKey,
+		metadata.VideoDurationHeaderKey,
+		metadata.VideoResolutionHeaderKey,
 		metadata.DestinationEndpointKey,
 		metadata.DestinationEndpointServedKey,
+		metadata.FlowQueueDurationHeaderKey,
 		errcommon.RequestDroppedReasonHeaderKey,
 		"Content-Length",
 	}

@@ -35,6 +35,9 @@ var (
 		metadata.SubsetFilterKey,
 		metadata.TTFTSLOHeaderKey,
 		metadata.TPOTSLOHeaderKey,
+		metadata.VideoFPSHeaderKey,
+		metadata.VideoDurationHeaderKey,
+		metadata.VideoResolutionHeaderKey,
 	)
 
 	// OutputInjectionHeaders are headers EPP injects for the backend.
@@ -43,6 +46,7 @@ var (
 		lowerHeaderNames(
 			metadata.DestinationEndpointKey,
 			metadata.DestinationEndpointServedKey,
+			metadata.FlowQueueDurationHeaderKey,
 		),
 		errcommon.RequestDroppedReasonHeaderKey,
 	)

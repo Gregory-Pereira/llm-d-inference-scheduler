@@ -32,6 +32,7 @@ import (
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/parsers/openai"
+	parserutil "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/parsers/util"
 )
 
 const (
@@ -43,7 +44,10 @@ const (
 )
 
 // compile-time type validation
-var _ fwkrh.Parser = &VllmHTTPParser{}
+var (
+	_ fwkrh.Parser            = &VllmHTTPParser{}
+	_ fwkrh.ModelNameRewriter = &VllmHTTPParser{}
+)
 
 // VllmHTTPParser implements fwkrh.Parser for vLLM HTTP endpoints. It handles
 // /inference/v1/generate and delegates response parsing to an embedded
@@ -102,11 +106,16 @@ func (p *VllmHTTPParser) ParseResponse(ctx context.Context, body []byte, headers
 	return p.openai.ParseResponse(ctx, body, headers, isStreaming)
 }
 
+// RewriteModelName delegates to the OpenAI parser; the generate body shares the payload map format.
+func (p *VllmHTTPParser) RewriteModelName(payload fwkrh.MarshalablePayload, model string) (fwkrh.MarshalablePayload, error) {
+	return p.openai.RewriteModelName(payload, model)
+}
+
 // parseGenerateRequest decodes a /inference/v1/generate body into an
 // InferenceRequestBody. Token IDs are required; everything else is optional.
 func (p *VllmHTTPParser) parseGenerateRequest(rawBody []byte) (*fwkrh.ParseResult, error) {
-	bodyMap := make(map[string]any)
-	if err := json.Unmarshal(rawBody, &bodyMap); err != nil {
+	bodyMap, err := parserutil.UnmarshalMapWithRawField(rawBody, "token_ids")
+	if err != nil {
 		return nil, err
 	}
 
@@ -121,6 +130,9 @@ func (p *VllmHTTPParser) parseGenerateRequest(rawBody []byte) (*fwkrh.ParseResul
 	body := &fwkrh.InferenceRequestBody{
 		Generate: &generate,
 		Payload:  fwkrh.PayloadMap(bodyMap),
+	}
+	if model, ok := bodyMap["model"].(string); ok {
+		body.Model = model
 	}
 	// max_tokens lives under sampling_params in the generate wire format.
 	if sp, ok := bodyMap["sampling_params"].(map[string]any); ok {

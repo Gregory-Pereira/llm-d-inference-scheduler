@@ -94,7 +94,7 @@ func CreateMissingDataProducers(ctx context.Context, defaultProducerRegistry map
 		for key, consumerName := range missingKeys {
 			defaultProducerNameOrType, ok := defaultProducerRegistry[key]
 			if !ok {
-				return fmt.Errorf("no default producer found for missing data key: %v, which is consumed by: %v", key, consumerName)
+				return fmt.Errorf("%w %v, consumed by %v", ErrNoDefaultProducer, key, consumerName)
 			}
 			if handle.Plugin(defaultProducerNameOrType) != nil {
 				// Already created. This can happen when a producer produces multiple data keys.
@@ -222,9 +222,13 @@ func buildDAG(producers map[string]plugin.ProducerPlugin, consumers map[string]p
 				continue
 			}
 			dependencies := consumer.Consumes()
-			if producer.Produces() != nil && dependencies.Required != nil {
+			if producer.Produces() != nil {
 				for producedKey, producedData := range producer.Produces() {
-					if consumedData, ok := dependencies.Required[producedKey]; ok {
+					consumedData, ok := dependencies.Required[producedKey]
+					if !ok {
+						consumedData, ok = dependencies.Optional[producedKey]
+					}
+					if ok {
 						// Check types are same.
 						if reflect.TypeOf(producedData) != reflect.TypeOf(consumedData) {
 							return nil, errors.New("data type mismatch between produced and consumed data for key: " + producedKey.String())

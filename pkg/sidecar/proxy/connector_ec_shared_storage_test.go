@@ -197,6 +197,79 @@ func TestBuildEncoderRequest(t *testing.T) {
 	assert.Equal(t, "image_url", content[0]["type"])
 }
 
+// TestBuildEncoderRequest_MaxCompletionTokens is a regression test: a shallow
+// copy previously left the client's max_completion_tokens value untouched
+// alongside the newly-capped max_tokens=1, so a reasoning-model client's
+// large max_completion_tokens would survive uncapped into the encoder request.
+func TestBuildEncoderRequest_MaxCompletionTokens(t *testing.T) {
+	originalRequest := map[string]any{
+		"model": "test-model",
+		"messages": []any{
+			map[string]any{
+				"role": "user",
+				"content": []any{
+					map[string]any{
+						"type": "image_url",
+						"image_url": map[string]any{
+							"url": "https://example.com/image.jpg",
+						},
+					},
+				},
+			},
+		},
+		"max_tokens":            50,
+		"max_completion_tokens": 100,
+	}
+
+	mmItem := map[string]any{
+		"type": "image_url",
+		"image_url": map[string]any{
+			"url": "https://example.com/image.jpg",
+		},
+	}
+
+	encoderRequest := buildEncoderRequest(originalRequest, mmItem)
+
+	assert.Equal(t, 1, encoderRequest["max_tokens"])
+	assert.Equal(t, 1, encoderRequest["max_completion_tokens"])
+}
+
+// TestBuildEncoderRequest_MinTokens is a regression test: a client-supplied
+// min_tokens above the encoder leg's max_tokens=1 cap trips vLLM's
+// min_tokens<=max_tokens validation.
+func TestBuildEncoderRequest_MinTokens(t *testing.T) {
+	originalRequest := map[string]any{
+		"model": "test-model",
+		"messages": []any{
+			map[string]any{
+				"role": "user",
+				"content": []any{
+					map[string]any{
+						"type": "image_url",
+						"image_url": map[string]any{
+							"url": "https://example.com/image.jpg",
+						},
+					},
+				},
+			},
+		},
+		"max_tokens": 50,
+		"min_tokens": 5,
+	}
+
+	mmItem := map[string]any{
+		"type": "image_url",
+		"image_url": map[string]any{
+			"url": "https://example.com/image.jpg",
+		},
+	}
+
+	encoderRequest := buildEncoderRequest(originalRequest, mmItem)
+
+	assert.Equal(t, 1, encoderRequest["max_tokens"])
+	assert.NotContains(t, encoderRequest, "min_tokens")
+}
+
 func TestMMItemURL(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -276,9 +349,18 @@ func videoURLItem(url string) map[string]any {
 	return map[string]any{"type": "video_url", "video_url": map[string]any{"url": url}}
 }
 
-// inlineAudioItem builds an input_audio content item.
-func inlineAudioItem(data, format string) map[string]any {
-	return map[string]any{"type": "input_audio", "input_audio": map[string]any{"data": data, "format": format}}
+// audioURLItem builds an audio_url content item. audio_url is the URL-based,
+// dedup-eligible audio type (paired with image_url and video_url in mmTypes);
+// inlineAudioItem covers the input_audio inline path instead.
+func audioURLItem(url string) map[string]any {
+	return map[string]any{"type": "audio_url", "audio_url": map[string]any{"url": url}}
+}
+
+// inlineAudioItem builds an input_audio content item. Format is fixed to
+// "wav" — no test currently exercises another format; add a parameter back
+// when a caller needs one.
+func inlineAudioItem(data string) map[string]any {
+	return map[string]any{"type": "input_audio", "input_audio": map[string]any{"data": data, "format": "wav"}}
 }
 
 // userMessageRequest wraps content items in a minimal chat-completions request.
@@ -333,7 +415,7 @@ func TestFanoutEncoderPrimerDeduplication(t *testing.T) {
 		},
 		{
 			name:          "inline audio items are never deduplicated",
-			request:       userMessageRequest(inlineAudioItem("aaa", "wav"), inlineAudioItem("aaa", "wav")),
+			request:       userMessageRequest(inlineAudioItem("aaa"), inlineAudioItem("aaa")),
 			expectedCalls: 2,
 		},
 	}

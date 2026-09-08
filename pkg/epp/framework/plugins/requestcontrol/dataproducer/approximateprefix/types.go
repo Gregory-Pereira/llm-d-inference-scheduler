@@ -17,6 +17,7 @@ limitations under the License.
 package approximateprefix
 
 import (
+	"math"
 	"time"
 
 	k8stypes "k8s.io/apimachinery/pkg/types"
@@ -32,6 +33,7 @@ type indexerInterface interface {
 	Add(hashes []blockHash, server server)
 	RemovePod(server ServerID)
 	Pods() []ServerID
+	PodBlockCounts() map[ServerID]int
 }
 
 // podSet holds a set of pods that may have a specific prefix hash.
@@ -98,7 +100,8 @@ const (
 	defaultBlockSizeTokens = 16
 
 	// defaultMaxPrefixBlocks is the fallback block cap, consulted only when
-	// MaxPrefixTokensToMatch is 0; the default token cap otherwise supersedes it.
+	// MaxPrefixTokensToMatch is 0 and MaxPrefixBlocksToMatch is non-zero; the
+	// default token cap otherwise supersedes it.
 	// Two long requests with the same prefix up to this limit will be indistinguishable.
 	// This parameter provides a trade-off between cache size, prefix matching speed and matching
 	// accuracy. Use a small value if most requests are short to reduce cache size and speed up the
@@ -111,6 +114,12 @@ const (
 	// over defaultMaxPrefixBlocks: maxBlocks = defaultMaxPrefixTokens / blockSizeTokens.
 	defaultMaxPrefixTokens = 131072
 
+	// unlimitedPrefixBlocks is the block cap used when both MaxPrefixTokensToMatch
+	// and MaxPrefixBlocksToMatch are 0. Prompt length is already bounded by the
+	// model server's context window, so an absent cap matches at most one context
+	// window of tokens.
+	unlimitedPrefixBlocks = math.MaxInt
+
 	// defaultLRUCapacityPerServer is the default capacity of the LRU indexer per server.
 	// The indexer is an approximation to the actual prefix LRU cache state on the model servers per server (pod).
 	// A small capacity ensures a high accuracy of cache hit on the model server, but it will
@@ -119,7 +128,7 @@ const (
 	// servers. Consider the llama3 8B model on a H100 80GB GPUs. The size of the model weight is
 	// about 16GB. The remaining HBM used for caching prefixes is 64GB. Each
 	// token is about 128KB in size, so we can cache 500K tokens. Using the default block size of 16
-	// in vLLM, we will have 250K / 16 = 31.25K blocks.
+	// in vLLM, we will have 500K / 16 = 31.25K blocks.
 	defaultLRUCapacityPerServer = 31250
 )
 
@@ -134,11 +143,12 @@ type config struct {
 	BlockSize int `json:"blockSize"`
 	// Deprecated: use MaxPrefixTokensToMatch, which caps prefix matching in tokens
 	// independent of BlockSizeTokens. MaxPrefixBlocksToMatch applies only when
-	// MaxPrefixTokensToMatch is 0.
+	// MaxPrefixTokensToMatch is 0. Setting both to 0 matches the whole prompt.
 	MaxPrefixBlocksToMatch int `json:"maxPrefixBlocksToMatch"`
 	// MaxPrefixTokensToMatch is the maximum number of prefix tokens to match.
 	// When set (> 0), it takes precedence over MaxPrefixBlocksToMatch by computing
-	// maxBlocks = MaxPrefixTokensToMatch / blockSizeTokens.
+	// maxBlocks = MaxPrefixTokensToMatch / blockSizeTokens. Setting both caps to 0
+	// matches the whole prompt.
 	MaxPrefixTokensToMatch int `json:"maxPrefixTokensToMatch"`
 	// Max capacity size of the LRU indexer in number of entries per server (pod).
 	LRUCapacityPerServer int `json:"lruCapacityPerServer"`

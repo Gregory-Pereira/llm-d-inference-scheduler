@@ -23,7 +23,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${IMAGE_REGISTRY:=ghcr.io/llm-d}"
 
 # Set a default VLLM_SIMULATOR_TAG if not provided
-export VLLM_SIMULATOR_TAG="${VLLM_SIMULATOR_TAG:-v0.9.2}"
+export VLLM_SIMULATOR_TAG="${VLLM_SIMULATOR_TAG:-v0.10.2}"
 
 # VLLM_IMAGE: the vLLM container image to deploy. Can be a simulator or real vLLM image
 # (e.g., vllm/vllm-openai:v0.16.0 for production). Defaults to the simulator image.
@@ -65,6 +65,8 @@ export SIDECAR_IMAGE
 # Set a default VLLM_RENDER_IMAGE if not provided (CPU-only vLLM image that
 # runs `vllm launch render` for the token-producer plugin's HTTP backend).
 export VLLM_RENDER_IMAGE="${VLLM_RENDER_IMAGE:-vllm/vllm-openai-cpu:v0.21.0}"
+export VLLM_RENDER_PORT="${VLLM_RENDER_PORT:-8082}"
+export VLLM_RENDER_URL="${VLLM_RENDER_URL:-http://vllm-render:${VLLM_RENDER_PORT}}"
 
 # Set the inference pool name for the deployment
 export POOL_NAME="${POOL_NAME:-${MODEL_NAME_SAFE}-inference-pool}"
@@ -103,9 +105,6 @@ fi
 
 # By default we are not setting up for KV cache
 export KV_CACHE_ENABLED="${KV_CACHE_ENABLED:-false}"
-
-# By default we are not setting up for external tokenizer
-export EXTERNAL_TOKENIZER_ENABLED="${EXTERNAL_TOKENIZER_ENABLED:-false}"
 
 # Replica counts for E (Encode), P (Prefill), and D (Decode)
 export VLLM_REPLICA_COUNT_E="${VLLM_REPLICA_COUNT_E:-1}"
@@ -156,9 +155,7 @@ fi
 
 # Determine EPP config file based on disaggregation flags
 # KV cache and data parallel are independent options that work with any mode
-if [ "${EXTERNAL_TOKENIZER_ENABLED}" == "true" ]; then
-  DEFAULT_EPP_CONFIG="deploy/config/sim-epp-external-tokenizer-config.yaml"
-elif [ "${KV_CACHE_ENABLED}" == "true" ]; then
+if [ "${KV_CACHE_ENABLED}" == "true" ]; then
   DEFAULT_EPP_CONFIG="deploy/config/sim-epp-kvcache-config.yaml"
 elif [ "${DISAGG_E}" == "true" ] && [ "${DISAGG_P}" == "true" ]; then
   DEFAULT_EPP_CONFIG="deploy/config/sim-e-p-d-epp-config.yaml"
@@ -403,7 +400,7 @@ TEMP_FILE=$(mktemp)
 trap "rm -f \"${TEMP_FILE}\"" EXIT
 
 kubectl --context ${KUBE_CONTEXT} delete configmap epp-config --ignore-not-found
-envsubst '$MODEL_NAME' < ${EPP_CONFIG} > ${TEMP_FILE}
+envsubst '${MODEL_NAME} ${VLLM_RENDER_URL}' < ${EPP_CONFIG} > ${TEMP_FILE}
 kubectl --context ${KUBE_CONTEXT} create configmap epp-config --from-file=epp-config.yaml=${TEMP_FILE}
 
 # The replica count is changed in some end to end tests
@@ -414,7 +411,7 @@ export ENABLE_LEADER_ELECTION=false
 # Deploy Istio base (shared infrastructure)
 kubectl kustomize --enable-helm deploy/environments/dev/base-kind-istio \
   | envsubst '${POOL_NAME} ${MODEL_NAME} ${MODEL_NAME_SAFE} ${EPP_NAME} ${EPP_IMAGE} ${VLLM_IMAGE} \
-  ${SIDECAR_IMAGE} ${VLLM_RENDER_IMAGE} ${TARGET_PORTS} ${NAMESPACE} ${METRICS_ENDPOINT_AUTH} \
+  ${SIDECAR_IMAGE} ${VLLM_RENDER_IMAGE} ${VLLM_RENDER_PORT} ${VLLM_RENDER_URL} ${TARGET_PORTS} ${NAMESPACE} ${METRICS_ENDPOINT_AUTH} \
   ${EPP_REPLICA_COUNT} ${VLLM_REPLICA_COUNT_E} ${VLLM_REPLICA_COUNT_P} ${VLLM_REPLICA_COUNT_D} \
   ${VLLM_DATA_PARALLEL_SIZE} ${ENABLE_LEADER_ELECTION}' \
   | kubectl --context ${KUBE_CONTEXT} apply -f -
@@ -422,7 +419,7 @@ kubectl kustomize --enable-helm deploy/environments/dev/base-kind-istio \
 # Deploy scenario-specific vLLM components
 kubectl kustomize --enable-helm ${KUSTOMIZE_DIR} \
   | envsubst '${POOL_NAME} ${MODEL_NAME} ${MODEL_NAME_SAFE} ${EPP_NAME} ${EPP_IMAGE} ${VLLM_IMAGE} \
-  ${SIDECAR_IMAGE} ${VLLM_RENDER_IMAGE} ${TARGET_PORTS} ${NAMESPACE} \
+  ${SIDECAR_IMAGE} ${VLLM_RENDER_IMAGE} ${VLLM_RENDER_PORT} ${VLLM_RENDER_URL} ${TARGET_PORTS} ${NAMESPACE} \
   ${VLLM_REPLICA_COUNT_E} ${VLLM_REPLICA_COUNT_P} ${VLLM_REPLICA_COUNT_D} ${VLLM_DATA_PARALLEL_SIZE} \
   ${KV_CONNECTOR_TYPE} ${EC_CONNECTOR_TYPE} ${CONNECTOR_TYPE} ${KV_CACHE_ENABLED} ${HF_TOKEN} ${VLLM_SIM_MODE} \
   ${DECODE_ROLE} ${VLLM_EXTRA_ARGS_E} ${VLLM_EXTRA_ARGS_P} ${VLLM_EXTRA_ARGS_D}' \

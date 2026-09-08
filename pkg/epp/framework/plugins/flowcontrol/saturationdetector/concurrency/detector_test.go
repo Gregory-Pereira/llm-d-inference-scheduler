@@ -32,7 +32,6 @@ import (
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	attrconcurrency "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/concurrency"
-	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/inflightload"
 )
 
 // localRegistry is a thread-safe storage for simulated endpoint load.
@@ -109,6 +108,11 @@ func TestConcurrencyDetectorFactory(t *testing.T) {
 			name:       "invalid headroom",
 			configJSON: []byte(`{"headroom": -0.5}`),
 			wantError:  true,
+		},
+		{
+			name:       "valid hybrid mode",
+			configJSON: []byte(`{"concurrencyMode": "hybrid", "maxConcurrency": 10, "maxTokenConcurrency": 100}`),
+			wantError:  false,
 		},
 		{
 			name:       "invalid mode",
@@ -194,7 +198,7 @@ func TestDetector_Configuration(t *testing.T) {
 				newStubSchedulingEndpoint(reg, cleanEndpoint),
 			})
 			require.Len(t, kept, 1, "Filter should drop the overloaded endpoint")
-			require.Equal(t, cleanEndpoint, kept[0].GetMetadata().NamespacedName.Name)
+			require.Equal(t, cleanEndpoint, kept[0].GetMetadata().ID.Name)
 		})
 	})
 }
@@ -490,6 +494,111 @@ func TestDetector_TokenDeleteEndpoint(t *testing.T) {
 	require.InDelta(t, 0.0, detector.Saturation(ctx, candidates), 1e-6, "expected clean state after DeleteEndpoint")
 }
 
+// TestDetector_HybridSaturation verifies hybrid mode evaluates each endpoint as the more
+// saturated of its request and token dimensions and averages the result across endpoints.
+func TestDetector_HybridSaturation(t *testing.T) {
+	t.Parallel()
+
+	config := config{
+		mode:                modeHybrid,
+		maxConcurrency:      10,
+		maxTokenConcurrency: 100,
+	}
+
+	type endpointLoad struct {
+		requests int64
+		tokens   int64
+	}
+
+	tests := []struct {
+		name           string
+		endpoints      map[string]endpointLoad
+		wantSaturation float64
+	}{
+		{name: "empty", endpoints: map[string]endpointLoad{"endpoint-a": {0, 0}}, wantSaturation: 0.0},
+		// Single endpoint: saturation is the more saturated of its two dimensions.
+		{name: "tokens_dominate", endpoints: map[string]endpointLoad{"endpoint-a": {2, 80}}, wantSaturation: 0.8},   // max(0.2, 0.8)
+		{name: "requests_dominate", endpoints: map[string]endpointLoad{"endpoint-a": {9, 10}}, wantSaturation: 0.9}, // max(0.9, 0.1)
+		{name: "request_dimension_saturates_first", endpoints: map[string]endpointLoad{"endpoint-a": {10, 5}}, wantSaturation: 1.0},
+		{name: "token_dimension_saturates_first", endpoints: map[string]endpointLoad{"endpoint-a": {1, 100}}, wantSaturation: 1.0},
+		// Distinct endpoints saturated on different dimensions each report 1.0, so the pool
+		// averages to 1.0.
+		{
+			name:           "endpoints_saturated_on_different_dimensions",
+			endpoints:      map[string]endpointLoad{"endpoint-a": {10, 0}, "endpoint-b": {0, 100}},
+			wantSaturation: 1.0,
+		},
+		// One saturated endpoint and one idle endpoint average to the midpoint.
+		{
+			name:           "per_endpoint_average",
+			endpoints:      map[string]endpointLoad{"endpoint-a": {10, 0}, "endpoint-b": {0, 0}},
+			wantSaturation: 0.5, // mean(1.0, 0.0)
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			reg := newLocalRegistry()
+			ctx := context.Background()
+			detector := newDetector("test-detector", config, logr.Discard())
+
+			candidates := make([]datalayer.Endpoint, 0, len(tc.endpoints))
+			for name, l := range tc.endpoints {
+				reg.update(fullEndpointName(name), func(load *attrconcurrency.InFlightLoad) {
+					load.Requests = l.requests
+					load.Tokens = l.tokens
+				})
+				candidates = append(candidates, newFakeEndpoint(reg, name))
+			}
+
+			got := detector.Saturation(ctx, candidates)
+			require.InDelta(t, tc.wantSaturation, got, 1e-6, "hybrid saturation mismatch")
+		})
+	}
+}
+
+// TestDetector_HybridFilter verifies hybrid mode drops an endpoint when either dimension hits its limit.
+func TestDetector_HybridFilter(t *testing.T) {
+	t.Parallel()
+
+	// headroom 0.0 -> limits are exactly maxConcurrency (10) and maxTokenConcurrency (100).
+	config := config{
+		mode:                modeHybrid,
+		maxConcurrency:      10,
+		maxTokenConcurrency: 100,
+	}
+	ctx := context.Background()
+
+	tests := []struct {
+		name     string
+		requests int64
+		tokens   int64
+		wantKept int
+	}{
+		{name: "below_both_limits", requests: 5, tokens: 50, wantKept: 1},
+		{name: "request_limit_reached", requests: 10, tokens: 50, wantKept: 0},
+		{name: "token_limit_reached", requests: 5, tokens: 100, wantKept: 0},
+		{name: "both_over", requests: 20, tokens: 200, wantKept: 0},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			reg := newLocalRegistry()
+			detector := newDetector("test-detector", config, logr.Discard())
+			endpointName := "endpoint-a"
+			reg.update(fullEndpointName(endpointName), func(load *attrconcurrency.InFlightLoad) {
+				load.Requests = tc.requests
+				load.Tokens = tc.tokens
+			})
+
+			kept := detector.Filter(ctx, nil, []fwksched.Endpoint{newStubSchedulingEndpoint(reg, endpointName)})
+			require.Len(t, kept, tc.wantKept, "hybrid filter mismatch")
+		})
+	}
+}
+
 // TestDetector_ConcurrencyStress performs race condition check.
 func TestDetector_ConcurrencyStress(t *testing.T) {
 	t.Parallel()
@@ -565,12 +674,12 @@ func TestDetector_NilMetadataEndpoint(t *testing.T) {
 // --- Test Helpers & Mocks ---
 
 func simulatePreRequest(_ context.Context, reg *localRegistry, req *fwksched.InferenceRequest, result *fwksched.SchedulingResult) {
-	endpointName := result.ProfileResults[result.PrimaryProfileName].TargetEndpoints[0].GetMetadata().NamespacedName.Name
+	endpointName := result.ProfileResults[result.PrimaryProfileName].TargetEndpoints[0].GetMetadata().ID.Name
 	id := fullEndpointName(endpointName)
 	reg.update(id, func(load *attrconcurrency.InFlightLoad) {
 		load.Requests++
 		if req != nil {
-			load.Tokens += inflightload.NewSimpleTokenEstimator().Estimate(req)
+			load.Tokens += simulatedTokenLoad(req)
 		}
 	})
 }
@@ -579,11 +688,11 @@ func simulateResponseBody(_ context.Context, reg *localRegistry, req *fwksched.I
 	if metadata == nil || resp == nil || !resp.EndOfStream {
 		return
 	}
-	id := metadata.NamespacedName.String()
+	id := metadata.ID.String()
 	reg.update(id, func(load *attrconcurrency.InFlightLoad) {
 		load.Requests--
 		if req != nil {
-			load.Tokens -= inflightload.NewSimpleTokenEstimator().Estimate(req)
+			load.Tokens -= simulatedTokenLoad(req)
 		}
 	})
 }
@@ -602,9 +711,8 @@ func driveLoad(_ context.Context, reg *localRegistry, _ *detector, endpointName 
 func driveTokenLoad(_ context.Context, reg *localRegistry, _ *detector, endpointName string, requests []*fwksched.InferenceRequest) {
 	id := fullEndpointName(endpointName)
 	var total int64
-	estimator := inflightload.NewSimpleTokenEstimator()
 	for _, r := range requests {
-		total += estimator.Estimate(r)
+		total += simulatedTokenLoad(r)
 	}
 	reg.update(id, func(load *attrconcurrency.InFlightLoad) {
 		load.Tokens += total
@@ -642,20 +750,22 @@ func (e *liveEndpoint) UpdateMetrics(*datalayer.Metrics)             {}
 func (e *liveEndpoint) String() string                               { return e.id }
 
 // liveEndpoint also implements AttributeMap.
-func (e *liveEndpoint) Get(key string) (datalayer.Cloneable, bool) {
-	if key == attrconcurrency.InFlightLoadDataKey.String() {
+func (e *liveEndpoint) Get(key fwkplugin.DataKey) (datalayer.Cloneable, bool) {
+	if key == attrconcurrency.InFlightLoadDataKey {
 		return e.reg.get(e.id), true
 	}
 	return nil, false
 }
-func (e *liveEndpoint) Put(string, datalayer.Cloneable) {}
-func (e *liveEndpoint) Keys() []string                  { return []string{attrconcurrency.InFlightLoadDataKey.String()} }
-func (e *liveEndpoint) Clone() datalayer.AttributeMap   { return e }
+func (e *liveEndpoint) Put(fwkplugin.DataKey, datalayer.Cloneable) {}
+func (e *liveEndpoint) Keys() []fwkplugin.DataKey {
+	return []fwkplugin.DataKey{attrconcurrency.InFlightLoadDataKey}
+}
+func (e *liveEndpoint) Clone() datalayer.AttributeMap { return e }
 
 func newFakeEndpoint(reg *localRegistry, name string) datalayer.Endpoint {
 	id := fullEndpointName(name)
 	return &liveEndpoint{
-		metadata: &datalayer.EndpointMetadata{NamespacedName: types.NamespacedName{Name: name, Namespace: "default"}},
+		metadata: &datalayer.EndpointMetadata{ID: types.NamespacedName{Name: name, Namespace: "default"}},
 		reg:      reg,
 		id:       id,
 	}
@@ -671,33 +781,47 @@ type liveSchedulingEndpoint struct {
 
 func newStubSchedulingEndpoint(reg *localRegistry, name string) *liveSchedulingEndpoint {
 	return &liveSchedulingEndpoint{
-		metadata: &datalayer.EndpointMetadata{NamespacedName: types.NamespacedName{Name: name, Namespace: "default"}},
+		metadata: &datalayer.EndpointMetadata{ID: types.NamespacedName{Name: name, Namespace: "default"}},
 		reg:      reg,
 		id:       fullEndpointName(name),
 	}
 }
 
 func (f *liveSchedulingEndpoint) GetMetadata() *datalayer.EndpointMetadata { return f.metadata }
-func (f *liveSchedulingEndpoint) Get(key string) (datalayer.Cloneable, bool) {
-	if key == attrconcurrency.InFlightLoadDataKey.String() {
+func (f *liveSchedulingEndpoint) Get(key fwkplugin.DataKey) (datalayer.Cloneable, bool) {
+	if key == attrconcurrency.InFlightLoadDataKey {
 		return f.reg.get(f.id), true
 	}
 	return nil, false
 }
-func (f *liveSchedulingEndpoint) Put(string, datalayer.Cloneable) {}
-func (f *liveSchedulingEndpoint) Keys() []string {
-	return []string{attrconcurrency.InFlightLoadDataKey.String()}
+func (f *liveSchedulingEndpoint) Put(fwkplugin.DataKey, datalayer.Cloneable) {}
+func (f *liveSchedulingEndpoint) Keys() []fwkplugin.DataKey {
+	return []fwkplugin.DataKey{attrconcurrency.InFlightLoadDataKey}
 }
 func (f *liveSchedulingEndpoint) String() string                { return f.id }
 func (f *liveSchedulingEndpoint) Clone() datalayer.AttributeMap { return f }
 
+// simulatedTokenLoad models the per-request token contribution these saturation
+// tests rely on: input tokens plus a fixed 3:2 output allowance (1 input -> 3
+// total, 4 input -> 10 total). It is deliberately local so the saturation math
+// stays independent of the production in-flight token estimator's policy, which
+// derives output tokens from the outlen-bucket attribute rather than a fixed ratio.
+func simulatedTokenLoad(req *fwksched.InferenceRequest) int64 {
+	if req == nil || req.Body == nil || req.Body.TokenizedRequest == nil {
+		return 0
+	}
+	input := int64(req.Body.TokenizedRequest.TokenCount())
+	// round(input * 1.5) via integer half-up, matching the numbers these tests assert.
+	return input + (input*3+1)/2
+}
+
 // makeTokenRequest builds a request with inputTokens tokenized input tokens.
-// The estimator then derives total tokens as inputTokens * (1 + OutputRatio).
+// simulatedTokenLoad then derives total tokens as inputTokens + round(inputTokens * 1.5).
 func makeTokenRequest(requestID string, inputTokens int) *fwksched.InferenceRequest {
 	return &fwksched.InferenceRequest{
 		RequestID: requestID,
 		Body: &fwkrh.InferenceRequestBody{
-			TokenizedPrompt: &fwkrh.TokenizedPrompt{PerPromptTokens: [][]uint32{make([]uint32, inputTokens)}},
+			TokenizedRequest: &fwkrh.TokenizedRequest{Prompts: []fwkrh.PromptTokens{{TokenIDs: make([]uint32, inputTokens)}}},
 		},
 	}
 }
@@ -706,16 +830,16 @@ func makeTokenRequest(requestID string, inputTokens int) *fwksched.InferenceRequ
 // has not been populated yet.
 type nilMetadataEndpoint struct{}
 
-func (e *nilMetadataEndpoint) GetMetadata() *datalayer.EndpointMetadata     { return nil }
-func (e *nilMetadataEndpoint) UpdateMetadata(m *datalayer.EndpointMetadata) {}
-func (e *nilMetadataEndpoint) GetAttributes() datalayer.AttributeMap        { return e }
-func (e *nilMetadataEndpoint) GetMetrics() *datalayer.Metrics               { return nil }
-func (e *nilMetadataEndpoint) UpdateMetrics(*datalayer.Metrics)             {}
-func (e *nilMetadataEndpoint) String() string                               { return "nil-metadata" }
-func (e *nilMetadataEndpoint) Get(string) (datalayer.Cloneable, bool)       { return nil, false }
-func (e *nilMetadataEndpoint) Put(string, datalayer.Cloneable)              {}
-func (e *nilMetadataEndpoint) Keys() []string                               { return nil }
-func (e *nilMetadataEndpoint) Clone() datalayer.AttributeMap                { return e }
+func (e *nilMetadataEndpoint) GetMetadata() *datalayer.EndpointMetadata          { return nil }
+func (e *nilMetadataEndpoint) UpdateMetadata(m *datalayer.EndpointMetadata)      {}
+func (e *nilMetadataEndpoint) GetAttributes() datalayer.AttributeMap             { return e }
+func (e *nilMetadataEndpoint) GetMetrics() *datalayer.Metrics                    { return nil }
+func (e *nilMetadataEndpoint) UpdateMetrics(*datalayer.Metrics)                  {}
+func (e *nilMetadataEndpoint) String() string                                    { return "nil-metadata" }
+func (e *nilMetadataEndpoint) Get(fwkplugin.DataKey) (datalayer.Cloneable, bool) { return nil, false }
+func (e *nilMetadataEndpoint) Put(fwkplugin.DataKey, datalayer.Cloneable)        {}
+func (e *nilMetadataEndpoint) Keys() []fwkplugin.DataKey                         { return nil }
+func (e *nilMetadataEndpoint) Clone() datalayer.AttributeMap                     { return e }
 
 func TestDetector_NilEndpointInList(t *testing.T) {
 	t.Parallel()

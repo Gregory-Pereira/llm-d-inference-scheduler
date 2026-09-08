@@ -19,7 +19,9 @@ package multimodal
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"reflect"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -53,15 +55,17 @@ func TestFactory(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestExtractMMItemsFromTokenizedPrompt(t *testing.T) {
+func TestExtractMMItemsFromTokenizedRequest(t *testing.T) {
 	items := ExtractMMItems(&scheduling.InferenceRequest{
 		Body: &fwkrh.InferenceRequestBody{
-			TokenizedPrompt: &fwkrh.TokenizedPrompt{
-				MultiModalFeatures: []fwkrh.MultiModalFeature{
-					{Modality: fwkrh.ModalityImage, Hash: "image-a", Length: 576},
-					{Modality: fwkrh.ModalityImage, Hash: "image-b", Length: 0},
-					{Modality: fwkrh.ModalityImage, Hash: "image-a", Length: 144},
-				},
+			TokenizedRequest: &fwkrh.TokenizedRequest{
+				Prompts: []fwkrh.PromptTokens{{
+					MultiModalFeatures: []fwkrh.MultiModalFeature{
+						{Modality: fwkrh.ModalityImage, Hash: "image-a", Length: 576},
+						{Modality: fwkrh.ModalityImage, Hash: "image-b", Length: 0},
+						{Modality: fwkrh.ModalityImage, Hash: "image-a", Length: 144},
+					},
+				}},
 			},
 		},
 	})
@@ -72,7 +76,7 @@ func TestExtractMMItemsFromTokenizedPrompt(t *testing.T) {
 	}, items)
 }
 
-func TestExtractMMItemsNilTokenizedPromptReturnsNil(t *testing.T) {
+func TestExtractMMItemsNilTokenizedRequestReturnsNil(t *testing.T) {
 	items := ExtractMMItems(&scheduling.InferenceRequest{
 		Body: &fwkrh.InferenceRequestBody{},
 	})
@@ -82,7 +86,7 @@ func TestExtractMMItemsNilTokenizedPromptReturnsNil(t *testing.T) {
 func TestExtractMMItemsEmptyMultiModalFeaturesReturnsNil(t *testing.T) {
 	items := ExtractMMItems(&scheduling.InferenceRequest{
 		Body: &fwkrh.InferenceRequestBody{
-			TokenizedPrompt: &fwkrh.TokenizedPrompt{},
+			TokenizedRequest: &fwkrh.TokenizedRequest{},
 		},
 	})
 	assert.Nil(t, items)
@@ -132,7 +136,7 @@ func TestProduceMatchesMultiplePodsAndPreRequestUpdatesPlacement(t *testing.T) {
 		nil,
 		[]attrmm.MatchItem{{Hash: "hash-a", Size: 1, Modality: img}, {Hash: "hash-c", Size: 1, Modality: img}})
 
-	producer.PreRequest(context.Background(), request, schedulingResult(endpointC))
+	_ = producer.PreRequest(context.Background(), request, schedulingResult(endpointC))
 	producer.wg.Wait()
 
 	cache := producer.cacheSnapshot()
@@ -149,7 +153,7 @@ func TestLRUEviction(t *testing.T) {
 	for _, hash := range []string{"hash-1", "hash-2", "hash-3"} {
 		request := requestWithHashes(hash, map[string]int{hash: 1})
 		require.NoError(t, producer.Produce(context.Background(), request, []scheduling.Endpoint{endpoint}))
-		producer.PreRequest(context.Background(), request, schedulingResult(endpoint))
+		_ = producer.PreRequest(context.Background(), request, schedulingResult(endpoint))
 		producer.wg.Wait()
 	}
 
@@ -198,7 +202,7 @@ func TestExtractEndpointRemovesDeletedPod(t *testing.T) {
 
 	err := producer.Extract(context.Background(), fwkdl.EndpointEvent{
 		Type:     fwkdl.EventDelete,
-		Endpoint: fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{NamespacedName: podB}, nil),
+		Endpoint: fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{ID: podB}, nil),
 	})
 
 	require.NoError(t, err)
@@ -208,8 +212,9 @@ func TestExtractEndpointRemovesDeletedPod(t *testing.T) {
 }
 
 type testHandle struct {
-	ctx     context.Context
-	podList func() []k8stypes.NamespacedName
+	ctx                context.Context
+	podList            func() []k8stypes.NamespacedName
+	crossReplicaSyncer plugin.Plugin
 }
 
 func (h *testHandle) Context() context.Context {
@@ -234,6 +239,14 @@ func (h *testHandle) Metrics() plugin.MetricsRecorder {
 	return nil
 }
 
+func (h *testHandle) CrossReplicaSyncer() plugin.Plugin {
+	return h.crossReplicaSyncer
+}
+
+func (h *testHandle) SetCrossReplicaSyncer(syncer plugin.Plugin) {
+	h.crossReplicaSyncer = syncer
+}
+
 func (h *testHandle) PodList() []k8stypes.NamespacedName {
 	if h.podList == nil {
 		return nil
@@ -252,7 +265,7 @@ func newTestProducer(t *testing.T, params *Parameters, podList func() []k8stypes
 
 func newEndpoint(name k8stypes.NamespacedName) scheduling.Endpoint {
 	return scheduling.NewEndpoint(
-		&fwkdl.EndpointMetadata{NamespacedName: name},
+		&fwkdl.EndpointMetadata{ID: name},
 		&fwkdl.Metrics{},
 		nil,
 	)
@@ -266,7 +279,7 @@ func requestWithHashes(requestID string, hashToWeight map[string]int) *schedulin
 	return &scheduling.InferenceRequest{
 		RequestID: requestID,
 		Body: &fwkrh.InferenceRequestBody{
-			TokenizedPrompt: &fwkrh.TokenizedPrompt{MultiModalFeatures: features},
+			TokenizedRequest: &fwkrh.TokenizedRequest{Prompts: []fwkrh.PromptTokens{{MultiModalFeatures: features}}},
 		},
 	}
 }
@@ -282,10 +295,117 @@ func schedulingResult(target scheduling.Endpoint) *scheduling.SchedulingResult {
 
 func assertMatchInfo(t *testing.T, p *Producer, endpoint scheduling.Endpoint, matchedItems, requestItems []attrmm.MatchItem) {
 	t.Helper()
-	raw, ok := endpoint.Get(p.dk.String())
+	raw, ok := endpoint.Get(p.dk)
 	require.True(t, ok)
 	info, ok := raw.(*attrmm.EncoderCacheMatchInfo)
 	require.True(t, ok)
 	assert.ElementsMatch(t, matchedItems, info.MatchedItems())
 	assert.ElementsMatch(t, requestItems, info.RequestItems())
+}
+
+func TestDumpState(t *testing.T) {
+	podA := k8stypes.NamespacedName{Namespace: "default", Name: "pod-a"}
+	podB := k8stypes.NamespacedName{Namespace: "default", Name: "pod-b"}
+	podC := k8stypes.NamespacedName{Namespace: "default", Name: "pod-c"}
+	// podList is the datalayer's known pods (unsorted, and includes pod-c which
+	// has no cache entries); the per-pod cache view is tracked separately, so it
+	// is usually but not necessarily a subset.
+	podList := func() []k8stypes.NamespacedName {
+		return []k8stypes.NamespacedName{podB, podA, podC}
+	}
+	p, err := New(context.Background(), "test", &Parameters{}, podList)
+	require.NoError(t, err)
+
+	p.putCacheEntry("h1", podA)
+	p.putCacheEntry("h2", podA)
+	p.putCacheEntry("h3", podA)
+	p.putCacheEntry("h1", podB)
+	p.putCacheEntry("h2", podB)
+
+	payload, err := p.DumpState()
+	require.NoError(t, err)
+	// Content hashes (cache keys) must never reach the dump.
+	assert.NotContains(t, string(payload), "h1")
+
+	var state encoderCacheState
+	require.NoError(t, json.Unmarshal(payload, &state))
+	assert.Equal(t, encoderCacheState{
+		PodList:        []string{"default/pod-a", "default/pod-b", "default/pod-c"},
+		TotalKnownPods: 3,
+		Pods: []podItemCount{
+			{Pod: "default/pod-a", Items: 3},
+			{Pod: "default/pod-b", Items: 2},
+		},
+		TotalPods: 2,
+		MaxPods:   maxDebugDumpPods,
+	}, state)
+}
+
+func TestDumpStateCapsPods(t *testing.T) {
+	p, err := New(context.Background(), "test", &Parameters{}, nil)
+	require.NoError(t, err)
+
+	const extra = 5
+	for i := 0; i < maxDebugDumpPods+extra; i++ {
+		pod := k8stypes.NamespacedName{Namespace: "default", Name: fmt.Sprintf("pod-%03d", i)}
+		for j := 0; j <= i; j++ {
+			p.putCacheEntry(fmt.Sprintf("h-%03d-%03d", i, j), pod)
+		}
+	}
+
+	payload, err := p.DumpState()
+	require.NoError(t, err)
+
+	var state encoderCacheState
+	require.NoError(t, json.Unmarshal(payload, &state))
+	// The dump is partial: TotalPods exceeds the returned count, capped at MaxPods.
+	assert.Equal(t, maxDebugDumpPods+extra, state.TotalPods)
+	assert.Greater(t, state.TotalPods, state.MaxPods)
+	assert.Len(t, state.Pods, maxDebugDumpPods)
+	// The pod holding the most items is listed first.
+	assert.Equal(t, "default/pod-104", state.Pods[0].Pod)
+	assert.Equal(t, maxDebugDumpPods+extra, state.Pods[0].Items)
+}
+
+func TestDumpStateEmpty(t *testing.T) {
+	p, err := New(context.Background(), "test", &Parameters{}, nil)
+	require.NoError(t, err)
+
+	payload, err := p.DumpState()
+	require.NoError(t, err)
+	assert.True(t, json.Valid(payload))
+	// Empty lists serialize as [] not null, matching the documented response shape.
+	assert.Contains(t, string(payload), `"podList":[]`)
+	assert.Contains(t, string(payload), `"pods":[]`)
+
+	var state encoderCacheState
+	require.NoError(t, json.Unmarshal(payload, &state))
+	assert.Empty(t, state.Pods)
+	assert.Equal(t, 0, state.TotalPods)
+	assert.Equal(t, 0, state.TotalKnownPods)
+	assert.Equal(t, maxDebugDumpPods, state.MaxPods)
+}
+
+func TestDumpStateConcurrentWithWrites(t *testing.T) {
+	p, err := New(context.Background(), "test", &Parameters{}, nil)
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			pod := k8stypes.NamespacedName{Namespace: "default", Name: fmt.Sprintf("pod-%03d", i)}
+			p.putCacheEntry(fmt.Sprintf("h-%d", i), pod)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			if _, err := p.DumpState(); err != nil {
+				t.Errorf("DumpState returned error: %v", err)
+			}
+		}
+	}()
+	wg.Wait()
 }

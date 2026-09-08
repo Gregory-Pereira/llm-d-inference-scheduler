@@ -26,10 +26,11 @@ Backend selection:
   config whose plugins consume `TokenizedPrompt` (prefix cache, context-length,
   P/D routing) without declaring a `token-producer`.
 - **`vllm`** (or `modelName`): calls vLLM's `/v1/completions/render` and
-  `/v1/chat/completions/render` over plain HTTP (TLS is not supported). Future
-  protocol fields (e.g. `grpc`) can be added alongside `url` under the same
-  `vllm` block.
-- **`udsTokenizerConfig`**: deprecated gRPC-over-UDS sidecar (see warning below).
+  `/v1/chat/completions/render` over HTTP or HTTPS. TLS is driven by the URL
+  scheme (`https://`). For in-cluster endpoints using self-signed or private CA
+  certificates, configure `vllm.caCertPath` to trust the CA, and optionally
+  `vllm.clientCertPath`/`vllm.clientKeyPath` for mTLS. Future protocol fields
+  (e.g. `grpc`) can be added alongside `url` under the same `vllm` block.
 
 > [!WARNING]
 > The `estimate` backend approximates token boundaries (≈4 bytes/token); its
@@ -38,20 +39,18 @@ Backend selection:
 > If omitted, the auto-created `estimate` producer satisfies the dependency but
 > silently degrades precise cache correlation.
 
-> [!WARNING]
-> The `udsTokenizerConfig` backend (gRPC-over-UDS sidecar) is **deprecated**
-> and will be removed in a future release. Existing configs continue to work
-> but emit a deprecation warning at startup. Migrate to `vllm.url`. See
-> [Migration](#migration-from-udstokenizerconfig) below.
-
 ## Config
 
-| Parameter        | Default                 | Description                                                       |
-| ---------------- | ----------------------- | ----------------------------------------------------------------- |
-| `modelName`      | – (required for `vllm`) | Model whose tokenizer should be loaded / sent in render requests. |
-| `vllm.url`       | `http://localhost:8000` | Base URL of the vLLM render endpoint (no trailing slash).         |
-| `vllm.timeout`   | `5s`                    | Per-request timeout for text-only requests.                       |
-| `vllm.mmTimeout` | `30s`                   | Per-request timeout for multimodal requests.                      |
+| Parameter                  | Default                 | Description                                                                  |
+| -------------------------- | ----------------------- | ---------------------------------------------------------------------------- |
+| `modelName`                | – (required for `vllm`) | Model whose tokenizer should be loaded / sent in render requests.            |
+| `vllm.url`                 | `http://localhost:8000` | Base URL of the vLLM render endpoint (no trailing slash).                    |
+| `vllm.timeout`             | `5s`                    | Per-request timeout for text-only requests.                                  |
+| `vllm.mmTimeout`           | `30s`                   | Per-request timeout for multimodal requests.                                 |
+| `vllm.caCertPath`          | system CA pool          | PEM CA bundle for verifying the render endpoint when using `https://`.       |
+| `vllm.clientCertPath`      | –                       | Client certificate for mTLS with the render endpoint; requires `clientKeyPath`. |
+| `vllm.clientKeyPath`       | –                       | Client private key for mTLS; requires `clientCertPath`.                      |
+| `vllm.insecureSkipVerify`  | `false`                 | Skip server certificate verification when using `https://`; `caCertPath` is ignored when set. |
 
 The `estimate` backend tunes multimodal image placeholder estimation (empty uses
 the defaults below):
@@ -62,6 +61,37 @@ the defaults below):
 | `estimate.image.defaultResolution` | 640×360   | Dynamic-mode fallback when an image's dimensions can't be decoded.         |
 | `estimate.image.dynamic.factor`    | `1024`    | Dynamic-mode pixels-per-placeholder-token divisor.                         |
 | `estimate.image.static.staticToken`| –         | Static-mode per-image placeholder count.                                   |
+
+Video estimation is `min(frames × tokensPerFrame, maxVideoTokens)`. The per-frame
+token count and the frame count are configured independently, so the two common
+model shapes are mode combinations: qwen3 is `tokensPerFrame.mode=dynamic` +
+`frames.mode=sampled`; gemma4 is `tokensPerFrame.mode=static` +
+`frames.mode=strided`. Video duration, resolution, and source FPS come from the
+`x-llm-d-video-*` request headers below when present; otherwise each falls back to
+its config value and then the built-in default. Headers are request-level, so they
+apply to every video in the request.
+
+| Request header                  | Format          | Description                                     |
+| ------------------------------- | --------------- | ----------------------------------------------- |
+| `x-llm-d-video-duration-seconds`| float seconds   | Video length; overrides `defaultDuration`.      |
+| `x-llm-d-video-resolution`      | `WIDTHxHEIGHT`  | Frame resolution; overrides `defaultResolution`.|
+| `x-llm-d-video-fps`             | float           | Source frame rate; overrides `frames.strided.defaultSourceFPS` (strided mode). |
+
+| Parameter                             | Default   | Description                                                                                                                                                 |
+| ------------------------------------- | --------- |-------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `estimate.video.tokensPerFrame.mode`  | `dynamic` | `dynamic` (width×height/factor) or `static` (a constant per-frame count).                                                                                   |
+| `estimate.video.tokensPerFrame.dynamic.factor`| `1024` | Dynamic-mode pixels-per-placeholder-token divisor.                                                                                                          |
+| `estimate.video.tokensPerFrame.static.numTokensPerFrame` | – | Static-mode per-frame placeholder count.                                                                                                                    |
+| `estimate.video.frames.mode`          | `sampled` | `sampled` (clamp(duration×sampleFPS, minFrames, maxFrames) / temporalPatchSize) or `strided` (clamp(duration×sourceFPS/frameStride, minFrames, maxFrames)). |
+| `estimate.video.frames.minFrames`     | –         | Sampled/strided frame floor (0 = none). Models a processor's minimum frames.                                                                                |
+| `estimate.video.frames.maxFrames`     | –         | Sampled/strided frame cap (0 = uncapped).                                                                                                                   |
+| `estimate.video.frames.sampled.sampleFPS`     | `1`       | Sampled-mode sampling rate.                                                                                                                                 |
+| `estimate.video.frames.sampled.temporalPatchSize` | –     | Sampled-mode: merge every N sampled frames into one token group (qwen3-vl = 2; <2 = no merge).                                                              |
+| `estimate.video.frames.strided.defaultSourceFPS` | `24`   | Strided-mode source frame rate; fallback for the `x-llm-d-video-fps` header.                                                                                |
+| `estimate.video.frames.strided.frameStride`   | `1`       | Strided-mode divisor: keep every Nth source frame.                                                                                                          |
+| `estimate.video.defaultResolution`    | 640×360   | Per-frame resolution for dynamic tokens-per-frame; fallback for the `x-llm-d-video-resolution` header.                                                      |
+| `estimate.video.defaultDuration`      | `10`      | Video length in seconds for frame counting; fallback for the `x-llm-d-video-duration-seconds` header.                                                       |
+| `estimate.video.maxVideoTokens`       | –         | Overall placeholder cap for a video (0 = uncapped).                                                                                                         |
 
 ## Failure mode
 
@@ -75,7 +105,11 @@ The plugin calls `POST {http}/v1/completions/render` and
 `vllm serve <model>` and by the GPU-less `vllm launch render <model>`.
 Any reachable HTTP endpoint serving the same model the scheduler tokenizes
 for will work — sidecar in the EPP pod (loopback) or a dedicated Service
-shared by multiple EPP replicas.
+shared by multiple EPP replicas. When the inbound request carries an
+`Authorization` header, it is forwarded verbatim on render requests, so an
+endpoint started with `--api-key` accepts them; the startup warmup probe
+sends no `Authorization` header, so against such an endpoint it is skipped
+and the first request pays the cold-start cost.
 
 ```yaml
 # EPP pod spec
@@ -108,37 +142,32 @@ Plugin config — dedicated render Service:
       url: "http://vllm-render.default.svc.cluster.local:8000"
 ```
 
-A complete sample config that pairs this with `precise-prefix-cache-producer` and `prefix-cache-scorer` is at [`deploy/config/sim-epp-tokenizer-vllm-http-config.yaml`](../../../../../../../deploy/config/sim-epp-tokenizer-vllm-http-config.yaml).
-
-## Migration from `udsTokenizerConfig`
-
-The legacy UDS backend ran a per-pod tokenizer sidecar and connected over a
-shared Unix domain socket. Replace it with the vLLM HTTP /render backend,
-which calls the same model-serving pods (or a co-located `vllm launch render`
-sidecar) and removes the dedicated tokenizer image.
-
-Before:
-
-```yaml
-- type: token-producer
-  parameters:
-    modelName: "${MODEL_NAME}"
-    udsTokenizerConfig:
-      socketFile: /tmp/tokenizer/tokenizer-uds.socket
-```
-
-After:
+Plugin config — dedicated render Service with TLS:
 
 ```yaml
 - type: token-producer
   parameters:
     modelName: "${MODEL_NAME}"
     vllm:
-      url: "http://localhost:8000"   # or a shared render Service
+      url: "https://vllm-render.default.svc.cluster.local:8000"
+      caCertPath: "/path/to/ca.crt"
 ```
 
-See the [Deployment](#deployment) section above for sidecar vs shared-Service
-options.
+The render endpoint must also be serving TLS. When using `vllm launch render`,
+pass `--ssl-certfile` and `--ssl-keyfile` so the process listens over HTTPS:
+
+```yaml
+containers:
+- name: vllm-render
+  command: ["vllm", "launch", "render"]
+  args:
+    - "${MODEL_NAME}"
+    - "--port=8000"
+    - "--ssl-certfile=/path/to/tls.crt"
+    - "--ssl-keyfile=/path/to/tls.key"
+```
+
+A complete sample config that pairs this with `precise-prefix-cache-producer` and `prefix-cache-scorer` is at [`deploy/config/sim-epp-tokenizer-vllm-http-config.yaml`](../../../../../../../deploy/config/sim-epp-tokenizer-vllm-http-config.yaml).
 
 ---
 
