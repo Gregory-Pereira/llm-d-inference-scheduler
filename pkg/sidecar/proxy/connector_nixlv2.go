@@ -498,9 +498,10 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 		present bool
 	}
 	tokenLimitFields := tokenLimitFieldsForAPIType(apiType)
+	tokenMap, createdSamplingParams := tokenLimitMap(body, apiType)
 	savedTokenValues := make([]savedField, len(tokenLimitFields))
 	for i, field := range tokenLimitFields {
-		if v, ok := body[field]; ok {
+		if v, ok := tokenMap[field]; ok {
 			savedTokenValues[i] = savedField{field: field, val: v, present: true}
 		} else {
 			savedTokenValues[i] = savedField{field: field}
@@ -549,7 +550,7 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 	body[requestFieldStream] = false
 	delete(body, requestFieldStreamOptions)
 	for _, field := range tokenLimitFields {
-		body[field] = 1
+		tokenMap[field] = 1
 	}
 
 	pbody, err := json.Marshal(body)
@@ -570,10 +571,15 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 		body[requestFieldStreamOptions] = streamOptionsValue
 	}
 	for _, sv := range savedTokenValues {
-		delete(body, sv.field)
+		delete(tokenMap, sv.field)
 		if sv.present {
-			body[sv.field] = sv.val
+			tokenMap[sv.field] = sv.val
 		}
+	}
+	// Drop the sampling_params map synthesized for prefill capping if it ended up
+	// empty, so the decode request matches the caller's original (which omitted it).
+	if createdSamplingParams && len(tokenMap) == 0 {
+		delete(body, requestFieldSamplingParams)
 	}
 
 	// Synthesise decode-leg kv_transfer_params that the serial path would
